@@ -8,7 +8,7 @@ BASE = 'Source/ThirdParty/ANGLE/src/libANGLE/renderer/metal/'
 REPLACEMENTS = [
     (BASE + 'ImageMtl.mm',
      '#include "libANGLE/renderer/metal/ImageMtl.h"',
-     '#include "libANGLE/renderer/metal/ImageMtl.h"\\n\\n#include <cstdlib>'),
+     '#include "libANGLE/renderer/metal/ImageMtl.h"\n\n#include <cstdlib>'),
     (BASE + 'DisplayMtl.mm',
      '    outExtensions->imageBase = true;',
      '    outExtensions->imageBase = true;\n    outExtensions->glTexture2DImage = true;'),
