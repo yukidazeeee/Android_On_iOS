@@ -45,6 +45,15 @@ list(APPEND SOURCES ${U}/host/libs/GLESv1_dec/GLESv1Decoder.cpp ${U}/host/libs/G
 add_library(androidemugl STATIC ${SOURCES} Backend.cpp Bridge.cpp)
 target_include_directories(androidemugl PRIVATE ${INCLUDES} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(androidemugl PRIVATE -Wno-format -Wno-deprecated-declarations)
+
+# Diagnostic escape hatch for the Android window -> ColorBuffer handoff.
+# Keep OFF for normal builds; turn ON only to bypass the reverse EGLImage path.
+option(EMUGL_FORCE_CPU_COLORBUFFER_BLIT
+       "Use synchronous CPU readback/upload instead of reverse EGLImage blit" OFF)
+if(EMUGL_FORCE_CPU_COLORBUFFER_BLIT)
+  target_compile_definitions(androidemugl PRIVATE AE_FORCE_CPU_COLORBUFFER_BLIT=1)
+endif()
+
 option(EMUGL_SANITIZE "Instrument renderer memory and undefined behavior" OFF)
 if(EMUGL_SANITIZE)
   target_compile_options(androidemugl PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)

@@ -23,6 +23,8 @@
 #include "TextureDraw.h"
 
 #include <stdio.h>
+#include <string.h>
+#include <vector>
 
 namespace {
 
@@ -147,8 +149,8 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
 
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     //
     // create another texture for that colorbuffer for blit
@@ -168,8 +170,8 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
 
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     cb->m_width = p_width;
     cb->m_height = p_height;
@@ -259,6 +261,12 @@ void ColorBuffer::subUpdate(int x,
         return;
     }
 
+    GLint previousTexture = 0;
+    GLint previousUnpack = 4;
+
+    s_gles2.glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+    s_gles2.glGetIntegerv(GL_UNPACK_ALIGNMENT, &previousUnpack);
+
     s_gles2.glBindTexture(GL_TEXTURE_2D, m_tex);
     s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     s_gles2.glTexSubImage2D(
@@ -266,58 +274,142 @@ void ColorBuffer::subUpdate(int x,
 #ifdef AE_SYNC_SHARED_IMAGES
     s_gles2.glFinish(); // CPU uploads become visible to guest image consumers.
 #endif
+
+    s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, previousUnpack);
+    s_gles2.glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
 }
 
 bool ColorBuffer::blitFromCurrentReadBuffer()
 {
     RenderThreadInfo *tInfo = RenderThreadInfo::get();
-    if (!tInfo->currContext.Ptr()) {
-        // no Current context
+    if (!tInfo || !tInfo->currContext.Ptr()) {
         return false;
     }
 
-    // Copy the content of the current read surface into m_blitEGLImage.
-    // This is done by creating a temporary texture, bind it to the EGLImage
-    // then call glCopyTexSubImage2D().
-    GLuint tmpTex;
-    GLint currTexBind;
-    GLint currFramebuffer;
-    // eglSwapBuffers presents the window, not the last offscreen layer bound
-    // by the guest. eglMakeCurrent preserves FBO bindings. Copying that FBO
-    // instead exposes layer pixels (or undefined pixels outside a smaller FBO).
+#ifdef AE_FORCE_CPU_COLORBUFFER_BLIT
+    // Diagnostic path: bypass only the reverse EGLImage handoff.
+    // The forward m_tex -> m_eglImage path remains enabled for gralloc/WebView.
+    const size_t pixelCount =
+            static_cast<size_t>(m_width) * static_cast<size_t>(m_height);
+    std::vector<unsigned char> rgba(pixelCount * 4);
+
+    if (tInfo->currContext->isGL2()) {
+        GLint previousFbo = 0;
+        GLint previousPack = 4;
+        s_gles2.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFbo);
+        s_gles2.glGetIntegerv(GL_PACK_ALIGNMENT, &previousPack);
+        s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        s_gles2.glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        s_gles2.glReadPixels(0, 0, m_width, m_height,
+                             GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        s_gles2.glFinish();
+        s_gles2.glPixelStorei(GL_PACK_ALIGNMENT, previousPack);
+        s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, previousFbo);
+    } else {
+        GLint previousFbo = 0;
+        GLint previousPack = 4;
+        s_gles1.glGetIntegerv(GL_FRAMEBUFFER_BINDING_OES, &previousFbo);
+        s_gles1.glGetIntegerv(GL_PACK_ALIGNMENT, &previousPack);
+        s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, 0);
+        s_gles1.glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        s_gles1.glReadPixels(0, 0, m_width, m_height,
+                             GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        s_gles1.glFinish();
+        s_gles1.glPixelStorei(GL_PACK_ALIGNMENT, previousPack);
+        s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, previousFbo);
+    }
+
+    const GLenum uploadFormat =
+            m_internalFormat == GL_RGB ? GL_RGB : GL_RGBA;
+    const size_t components = uploadFormat == GL_RGB ? 3u : 4u;
+    const size_t uploadRowBytes = static_cast<size_t>(m_width) * components;
+    std::vector<unsigned char> upload(
+            static_cast<size_t>(m_height) * uploadRowBytes);
+
+    // The normal TextureDraw blit flips GL bottom-left rows into gralloc's
+    // top-left convention. Do the same conversion explicitly here.
+    for (GLuint y = 0; y < m_height; ++y) {
+        const unsigned char *src =
+                rgba.data() +
+                static_cast<size_t>(m_height - 1u - y) *
+                        static_cast<size_t>(m_width) * 4u;
+        unsigned char *dst =
+                upload.data() + static_cast<size_t>(y) * uploadRowBytes;
+
+        if (uploadFormat == GL_RGBA) {
+            memcpy(dst, src, static_cast<size_t>(m_width) * 4u);
+        } else {
+            for (GLuint x = 0; x < m_width; ++x) {
+                dst[x * 3u + 0u] = src[x * 4u + 0u];
+                dst[x * 3u + 1u] = src[x * 4u + 1u];
+                dst[x * 3u + 2u] = src[x * 4u + 2u];
+            }
+        }
+    }
+
+    ScopedHelperContext context(m_helper);
+    if (!context.isOk()) {
+        return false;
+    }
+
+    GLint previousActiveTexture = GL_TEXTURE0;
+    GLint previousTexture = 0;
+    GLint previousUnpack = 4;
+    s_gles2.glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
+    s_gles2.glActiveTexture(GL_TEXTURE0);
+    s_gles2.glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+    s_gles2.glGetIntegerv(GL_UNPACK_ALIGNMENT, &previousUnpack);
+
+    s_gles2.glBindTexture(GL_TEXTURE_2D, m_tex);
+    s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    s_gles2.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height,
+                            uploadFormat, GL_UNSIGNED_BYTE, upload.data());
+    s_gles2.glFinish();
+
+    s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, previousUnpack);
+    s_gles2.glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+    s_gles2.glActiveTexture(static_cast<GLenum>(previousActiveTexture));
+    return true;
+#else
+    // Normal path: copy the guest window framebuffer into the reverse EGLImage.
+    // Keep the temporary EGLImage target alive until the producer commands have
+    // completed; this matters for the custom ANGLE/Metal EGLImage implementation.
+    GLuint tmpTex = 0;
+    GLint currTexBind = 0;
+    GLint currFramebuffer = 0;
+
     if (tInfo->currContext->isGL2()) {
         s_gles2.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &currFramebuffer);
         s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, 0);
         s_gles2.glGetIntegerv(GL_TEXTURE_BINDING_2D, &currTexBind);
-        s_gles2.glGenTextures(1,&tmpTex);
+        s_gles2.glGenTextures(1, &tmpTex);
         s_gles2.glBindTexture(GL_TEXTURE_2D, tmpTex);
         s_gles2.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_blitEGLImage);
         s_gles2.glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                                  m_width, m_height);
-        s_gles2.glDeleteTextures(1, &tmpTex);
+                                    m_width, m_height);
+#ifdef AE_SYNC_SHARED_IMAGES
+        s_gles2.glFinish();
+#endif
         s_gles2.glBindTexture(GL_TEXTURE_2D, currTexBind);
         s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, currFramebuffer);
-    }
-    else {
+        s_gles2.glDeleteTextures(1, &tmpTex);
+    } else {
         s_gles1.glGetIntegerv(GL_FRAMEBUFFER_BINDING_OES, &currFramebuffer);
         s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, 0);
         s_gles1.glGetIntegerv(GL_TEXTURE_BINDING_2D, &currTexBind);
-        s_gles1.glGenTextures(1,&tmpTex);
+        s_gles1.glGenTextures(1, &tmpTex);
         s_gles1.glBindTexture(GL_TEXTURE_2D, tmpTex);
         s_gles1.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_blitEGLImage);
         s_gles1.glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                                 m_width, m_height);
-        s_gles1.glDeleteTextures(1, &tmpTex);
+                                    m_width, m_height);
+#ifdef AE_SYNC_SHARED_IMAGES
+        s_gles1.glFinish();
+#endif
         s_gles1.glBindTexture(GL_TEXTURE_2D, currTexBind);
         s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, currFramebuffer);
+        s_gles1.glDeleteTextures(1, &tmpTex);
     }
 
-#ifdef AE_SYNC_SHARED_IMAGES
-    // EGLImage aliases cross independent guest/helper contexts. Scheduling the
-    // producer's Metal command buffer is not a completion fence for this handoff.
-    if (tInfo->currContext->isGL2()) s_gles2.glFinish();
-    else s_gles1.glFinish();
-#endif
     ScopedHelperContext context(m_helper);
     if (!context.isOk()) {
         return false;
@@ -327,24 +419,19 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
         return false;
     }
 
-    // Save current viewport and match it to the current colorbuffer size.
     GLint vport[4] = { 0, };
     s_gles2.glGetIntegerv(GL_VIEWPORT, vport);
     s_gles2.glViewport(0, 0, m_width, m_height);
 
-    // render m_blitTex
     bool drawn = m_helper->getTextureDraw()->draw(m_blitTex, 0.);
 #ifdef AE_SYNC_SHARED_IMAGES
-    // Complete the helper write before replying to the guest's buffer swap.
-    // Otherwise the compositor may sample/recycle this storage while it is busy.
     s_gles2.glFinish();
 #endif
 
-    // Restore previous viewport.
     s_gles2.glViewport(vport[0], vport[1], vport[2], vport[3]);
     unbindFbo();
-
     return drawn;
+#endif
 }
 
 bool ColorBuffer::bindToTexture() {

@@ -1,6 +1,7 @@
 """Pinned ANGLE Metal additions for Goldfish's GL texture EGLImages.
 
-Keep selected mip storage shared with the source and retain it when orphaned.
+Keep selected mip storage shared with the source. EGLImage owns its exported
+Metal TextureRef, so source texture orphaning must not mutate the old storage.
 Only advertise the texture-2D source target implemented here.
 """
 BASE = 'Source/ThirdParty/ANGLE/src/libANGLE/renderer/metal/'
@@ -13,23 +14,21 @@ REPLACEMENTS = [
      '''    const mtl::TextureRef &getNativeTexture() const { return mNativeTexture; }
 
     // Share the selected mip's native storage, not a snapshot of its pixels.
+    // The returned TextureRef is a strong reference owned by ImageMtl.
     angle::Result exportEGLImage(const gl::Context *context,
                                  const gl::ImageIndex &index,
                                  mtl::TextureRef *out)
     {
+        if (!out)
+            return angle::Result::Stop;
         if (ensureTextureCreated(context) != angle::Result::Continue ||
             ensureImageCreated(context, index) != angle::Result::Continue)
             return angle::Result::Stop;
-        *out = getImage(index);
-        return *out ? angle::Result::Continue : angle::Result::Stop;
-    }
-
-    void orphanEGLImage(const gl::ImageIndex &index)
-    {
-        // Keep unrelated mip levels, but detach this source image so a same-size
-        // glTexImage cannot overwrite storage still owned by EGLImage siblings.
-        releaseTexture(false, true);
-        getImage(index).reset();
+        mtl::TextureRef image = getImage(index);
+        if (!image)
+            return angle::Result::Stop;
+        *out = image;
+        return angle::Result::Continue;
     }'''),
     (BASE + 'ImageMtl.h',
      '    gl::TextureType mImageTextureType;',
@@ -66,12 +65,12 @@ REPLACEMENTS = [
     {
         mNativeTexture = nullptr;
     }''',
-     '''    // EGLImage siblings must keep the old storage when the source texture
-    // is deleted or respecified. The shared TextureRef owns that storage until
-    // this image and its targets release it; onDestroy handles final release.
+     '''    // EGLImage siblings keep their exported TextureRef when the source GL
+    // texture is deleted or respecified. Do not mutate TextureMtl here: the
+    // old Metal storage remains alive until ImageMtl/onDestroy releases it.
     (void)context;
-    if (sibling == mState.source && mState.target == EGL_GL_TEXTURE_2D_KHR)
+    if (sibling == mState.source && mState.target != EGL_GL_TEXTURE_2D_KHR)
     {
-        GetImplAs<TextureMtl>(GetAs<gl::Texture>(sibling))->orphanEGLImage(mState.imageIndex);
+        mNativeTexture = nullptr;
     }'''),
 ]

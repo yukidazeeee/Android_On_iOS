@@ -161,7 +161,18 @@ bool TextureDraw::draw(GLuint texture, float rotation) {
         return false;
     }
 
-    // TODO(digit): Save previous program state.
+    GLint previousProgram = 0;
+    GLint previousArrayBuffer = 0;
+    GLint previousElementBuffer = 0;
+    GLint previousActiveTexture = GL_TEXTURE0;
+    GLint previousTexture0 = 0;
+
+    s_gles2.glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
+    s_gles2.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previousArrayBuffer);
+    s_gles2.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &previousElementBuffer);
+    s_gles2.glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
+    s_gles2.glActiveTexture(GL_TEXTURE0);
+    s_gles2.glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture0);
 
     GLenum err;
 
@@ -242,7 +253,16 @@ bool TextureDraw::draw(GLuint texture, float rotation) {
             __FUNCTION__, err);
     }
 
-    // TODO(digit): Restore previous program state.
+    // Keep the shared helper context deterministic for the next operation.
+    s_gles2.glActiveTexture(GL_TEXTURE0);
+    s_gles2.glBindTexture(
+            GL_TEXTURE_2D, static_cast<GLuint>(previousTexture0));
+    s_gles2.glBindBuffer(
+            GL_ARRAY_BUFFER, static_cast<GLuint>(previousArrayBuffer));
+    s_gles2.glBindBuffer(
+            GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(previousElementBuffer));
+    s_gles2.glUseProgram(static_cast<GLuint>(previousProgram));
+    s_gles2.glActiveTexture(static_cast<GLenum>(previousActiveTexture));
 
     return true;
 }

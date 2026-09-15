@@ -120,7 +120,10 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
             "GL_OES_vertex_half_float", "GL_OES_vertex_array_object",
             "GL_EXT_texture_format_BGRA8888", "GL_EXT_read_format_bgra",
             "GL_EXT_texture_filter_anisotropic", "GL_EXT_blend_minmax",
-            "GL_EXT_discard_framebuffer", "GL_EXT_texture_compression_s3tc",
+#ifndef AE_ANGLE_METAL
+            "GL_EXT_discard_framebuffer",
+#endif
+            "GL_EXT_texture_compression_s3tc",
             "GL_OES_compressed_ETC1_RGB8_texture"
         };
         std::istringstream extensions(str); std::string extension;

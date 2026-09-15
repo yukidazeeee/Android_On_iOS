@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 namespace {
 
@@ -104,9 +105,12 @@ FbConfig::FbConfig(EGLConfig hostConfig, EGLDisplay hostDisplay) :
                                  &mAttribValues[i]);
 
         // This implementation supports guest window surfaces by wrapping
-        // them around host Pbuffers, so always report it to the guest.
+        // them around host Pbuffers, so report EGL_WINDOW_BIT. ANGLE Metal's
+        // pbuffer surface does not implement preserved swap semantics, however,
+        // so never advertise EGL_SWAP_BEHAVIOR_PRESERVED_BIT to the guest.
         if (kConfigAttributes[i] == EGL_SURFACE_TYPE) {
             mAttribValues[i] |= EGL_WINDOW_BIT;
+            mAttribValues[i] &= ~EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
         }
     }
 }
@@ -160,92 +164,95 @@ int FbConfigList::chooseConfig(const EGLint* attribs,
         return 0;
     }
 
-    EGLConfig* matchedConfigs = new EGLConfig[numHostConfigs];
-
-    // If EGL_SURFACE_TYPE appears in |attribs|, the value passed to
-    // eglChooseConfig should be forced to EGL_PBUFFER_BIT because that's
-    // what it used by the current implementation, exclusively. This forces
-    // the rewrite of |attribs| into a new array.
+    std::vector<EGLint> hostAttribs;
+    EGLint requestedSurfaceType = EGL_DONT_CARE;
+    EGLint requestedAPI = EGL_OPENGL_ES_BIT;
     bool hasSurfaceType = false;
-    bool mustReplaceSurfaceType = false;
-    int numAttribs = 0;
-    while (attribs[numAttribs] != EGL_NONE) {
-        if (attribs[numAttribs] == EGL_SURFACE_TYPE) {
-            hasSurfaceType = true;
-            if (attribs[numAttribs + 1] != EGL_PBUFFER_BIT) {
-                mustReplaceSurfaceType = true;
+
+    if (attribs) {
+        for (const EGLint* a = attribs; a[0] != EGL_NONE; a += 2) {
+            const EGLint name = a[0];
+            const EGLint value = a[1];
+
+            hostAttribs.push_back(name);
+            if (name == EGL_SURFACE_TYPE) {
+                hasSurfaceType = true;
+                requestedSurfaceType = value;
+
+                // The guest's WINDOW surface is implemented by a host pbuffer.
+                // Translate only that bit. Keep PRESERVED and every other bit
+                // so unsupported semantics correctly cause chooseConfig to fail.
+                if (value == EGL_DONT_CARE) {
+                    hostAttribs.push_back(EGL_PBUFFER_BIT);
+                } else {
+                    EGLint translated = value;
+                    translated &= ~EGL_WINDOW_BIT;
+                    translated |= EGL_PBUFFER_BIT;
+                    hostAttribs.push_back(translated);
+                }
+            } else {
+                hostAttribs.push_back(value);
+                if (name == EGL_RENDERABLE_TYPE) {
+                    requestedAPI = value;
+                }
             }
         }
-        numAttribs += 2;
     }
 
-    EGLint* newAttribs = NULL;
-
-    if (mustReplaceSurfaceType) {
-        // There is at least on EGL_SURFACE_TYPE in |attribs|. Copy the
-        // array and replace all values with EGL_PBUFFER_BIT
-        newAttribs = new GLint[numAttribs + 1];
-        memcpy(newAttribs, attribs, numAttribs * sizeof(GLint));
-        newAttribs[numAttribs] = EGL_NONE;
-        for (int n = 0; n < numAttribs; n += 2) {
-            if (newAttribs[n] == EGL_SURFACE_TYPE) {
-                newAttribs[n + 1] = EGL_PBUFFER_BIT;
-            }
-        }
-    } else if (!hasSurfaceType) {
-        // There is no EGL_SURFACE_TYPE in |attribs|, then add one entry
-        // with the value EGL_PBUFFER_BIT.
-        newAttribs = new GLint[numAttribs + 3];
-        memcpy(newAttribs, attribs, numAttribs * sizeof(GLint));
-        newAttribs[numAttribs] = EGL_SURFACE_TYPE;
-        newAttribs[numAttribs + 1] = EGL_PBUFFER_BIT;
-        newAttribs[numAttribs + 2] = EGL_NONE;
+    if (!hasSurfaceType) {
+        hostAttribs.push_back(EGL_SURFACE_TYPE);
+        hostAttribs.push_back(EGL_PBUFFER_BIT);
     }
+    hostAttribs.push_back(EGL_NONE);
 
+    std::vector<EGLConfig> matchedConfigs(
+            static_cast<size_t>(numHostConfigs));
+    EGLint matchedCount = 0;
     if (!s_egl.eglChooseConfig(mDisplay,
-                               newAttribs ? newAttribs : attribs,
-                               matchedConfigs,
+                               hostAttribs.data(),
+                               matchedConfigs.data(),
                                numHostConfigs,
-                               &numHostConfigs)) {
-        numHostConfigs = 0;
+                               &matchedCount)) {
+        return 0;
     }
 
-    delete [] newAttribs;
-
-    GLint requestedAPI = EGL_OPENGL_ES_BIT;
-    for (const GLint *a = attribs; a && a[0] != EGL_NONE; a += 2) {
-        if (a[0] == EGL_RENDERABLE_TYPE) requestedAPI = a[1];
-    }
     int result = 0;
-    for (int n = 0; n < numHostConfigs; ++n) {
-        // Don't count or write more than |configsSize| items if |configs|
-        // is not NULL.
+    for (EGLint n = 0; n < matchedCount; ++n) {
         if (configs && configsSize > 0 && result >= configsSize) {
             break;
         }
-        // Skip incompatible host configs.
         if (!isCompatibleHostConfig(matchedConfigs[n], mDisplay)) {
             continue;
         }
-        // Find the FbConfig with the same EGL_CONFIG_ID
-        EGLint hostConfigId;
-        s_egl.eglGetConfigAttrib(
-                mDisplay, matchedConfigs[n], EGL_CONFIG_ID, &hostConfigId);
+
+        EGLint hostConfigId = 0;
+        if (!s_egl.eglGetConfigAttrib(
+                mDisplay, matchedConfigs[n], EGL_CONFIG_ID, &hostConfigId)) {
+            continue;
+        }
+
         for (int k = 0; k < mCount; ++k) {
-            int guestConfigId = mConfigs[k]->getConfigId();
-            if (guestConfigId == hostConfigId &&
-                (mConfigs[k]->getRenderableType() & requestedAPI) == requestedAPI) {
-                // There is a match. Write it to |configs| if it is not NULL.
-                if (configs && result < configsSize) {
-                    configs[result] = (uint32_t)k;
-                }
-                result ++;
-                break;
+            FbConfig* guest = mConfigs[k];
+            if (guest->getConfigId() != hostConfigId) {
+                continue;
             }
+            if (requestedAPI != EGL_DONT_CARE &&
+                (guest->getRenderableType() & requestedAPI) != requestedAPI) {
+                continue;
+            }
+            if (requestedSurfaceType != EGL_DONT_CARE &&
+                (static_cast<EGLint>(guest->getSurfaceType()) &
+                 requestedSurfaceType) != requestedSurfaceType) {
+                continue;
+            }
+
+            if (configs && result < configsSize) {
+                configs[result] = static_cast<EGLint>(k);
+            }
+            ++result;
+            break;
         }
     }
-
-    delete [] matchedConfigs;
 
     return result;
 }
