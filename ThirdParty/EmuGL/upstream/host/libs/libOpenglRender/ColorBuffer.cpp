@@ -16,6 +16,7 @@
 #include "ColorBuffer.h"
 
 #include "EGLDispatch.h"
+#include "GraphicsDiagnostics.h"
 #include "GLESv1Dispatch.h"
 #include "GLcommon/GLutils.h"
 #include "GLESv2Dispatch.h"
@@ -147,8 +148,10 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
                          GL_UNSIGNED_BYTE,
                          zBuff);
 
-    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    const GLint colorFilter = aeGraphicsDiagEnabled("AE_DIAG_NEAREST_COLORBUFFER_FILTER")
+            ? GL_NEAREST : GL_LINEAR;
+    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, colorFilter);
+    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, colorFilter);
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -178,9 +181,12 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
     cb->m_internalFormat = texInternalFormat;
 
     if (has_eglimage_texture_2d) {
-        // Image creation may discard the source pixels unless preservation is
-        // explicit. Both buffers can be observed before the first full redraw.
-        const EGLint imageAttributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+        const EGLint preservedImageAttributes[] = {
+            EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE
+        };
+        const EGLint defaultImageAttributes[] = {EGL_NONE};
+        const EGLint *imageAttributes = aeGraphicsDiagEnabled("AE_DIAG_DISABLE_EGLIMAGE_PRESERVED")
+                ? defaultImageAttributes : preservedImageAttributes;
         cb->m_eglImage = s_egl.eglCreateImageKHR(
                 p_display,
                 s_egl.eglGetCurrentContext(),
@@ -197,8 +203,9 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
         if (!cb->m_eglImage || !cb->m_blitEGLImage) { delete cb; return NULL; }
     }
 #ifdef AE_SYNC_SHARED_IMAGES
-    // Publish initialized shared storage before another context imports it.
-    s_gles2.glFinish();
+    if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
+        s_gles2.glFinish();
+    }
 #endif
     return cb;
 }
@@ -272,7 +279,9 @@ void ColorBuffer::subUpdate(int x,
     s_gles2.glTexSubImage2D(
             GL_TEXTURE_2D, 0, x, y, width, height, p_format, p_type, pixels);
 #ifdef AE_SYNC_SHARED_IMAGES
-    s_gles2.glFinish(); // CPU uploads become visible to guest image consumers.
+    if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
+        s_gles2.glFinish();
+    }
 #endif
 
     s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, previousUnpack);
@@ -286,7 +295,11 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
         return false;
     }
 
+    bool useCpuReverseBlit = aeGraphicsDiagEnabled("AE_DIAG_CPU_REVERSE_BLIT");
 #ifdef AE_FORCE_CPU_COLORBUFFER_BLIT
+    useCpuReverseBlit = true;
+#endif
+    if (useCpuReverseBlit) {
     // Diagnostic path: bypass only the reverse EGLImage handoff.
     // The forward m_tex -> m_eglImage path remains enabled for gralloc/WebView.
     const size_t pixelCount =
@@ -370,7 +383,7 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
     s_gles2.glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
     s_gles2.glActiveTexture(static_cast<GLenum>(previousActiveTexture));
     return true;
-#else
+    } else {
     // Normal path: copy the guest window framebuffer into the reverse EGLImage.
     // Keep the temporary EGLImage target alive until the producer commands have
     // completed; this matters for the custom ANGLE/Metal EGLImage implementation.
@@ -388,7 +401,9 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
         s_gles2.glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
                                     m_width, m_height);
 #ifdef AE_SYNC_SHARED_IMAGES
-        s_gles2.glFinish();
+        if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
+            s_gles2.glFinish();
+        }
 #endif
         s_gles2.glBindTexture(GL_TEXTURE_2D, currTexBind);
         s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, currFramebuffer);
@@ -403,7 +418,9 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
         s_gles1.glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
                                     m_width, m_height);
 #ifdef AE_SYNC_SHARED_IMAGES
-        s_gles1.glFinish();
+        if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
+            s_gles1.glFinish();
+        }
 #endif
         s_gles1.glBindTexture(GL_TEXTURE_2D, currTexBind);
         s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, currFramebuffer);
@@ -425,13 +442,15 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
 
     bool drawn = m_helper->getTextureDraw()->draw(m_blitTex, 0.);
 #ifdef AE_SYNC_SHARED_IMAGES
-    s_gles2.glFinish();
+    if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
+        s_gles2.glFinish();
+    }
 #endif
 
     s_gles2.glViewport(vport[0], vport[1], vport[2], vport[3]);
     unbindFbo();
     return drawn;
-#endif
+    }
 }
 
 bool ColorBuffer::bindToTexture() {

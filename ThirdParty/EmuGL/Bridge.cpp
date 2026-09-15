@@ -1,5 +1,6 @@
 #include "Bridge.h"
 #include "FrameBuffer.h"
+#include "GraphicsDiagnostics.h"
 #include "RenderThread.h"
 #include "IOStream.h"
 #include "emugl/common/mutex.h"
@@ -26,19 +27,32 @@ std::vector<uint8_t> rgba;
 void post(void *, int w, int h, int direction, int format, int type, unsigned char *pixels) {
     (void)direction; // ColorBuffer blit already converts GL coordinates to gralloc top-left rows.
     if (w != int(width) || h != int(height) || format != 0x1908 || type != 0x1401 || !pixels) return;
+    const bool visualizeAlpha = aeGraphicsDiagEnabled("AE_DIAG_VISUALIZE_ALPHA");
+    const bool forceFullFrame =
+            visualizeAlpha || aeGraphicsDiagEnabled("AE_DIAG_FORCE_FULL_HOST_FRAME");
     std::lock_guard<std::mutex> lock(frameLock);
     for (unsigned y = 0; y < height; ++y) {
         const uint8_t *src = pixels + size_t(y) * width * 4;
         uint8_t *previous = rgba.data() + size_t(y) * width * 4;
-        if (havePost && !memcmp(previous, src, size_t(width) * 4)) continue;
+        if (!forceFullFrame && havePost &&
+            !memcmp(previous, src, size_t(width) * 4)) continue;
         memcpy(previous, src, size_t(width) * 4);
         uint8_t *dst = frame.data() + size_t(y) * width * 4;
         for (unsigned x = 0; x < width; ++x) {
-            dst[4*x] = src[4*x+2]; dst[4*x+1] = src[4*x+1];
-            dst[4*x+2] = src[4*x]; dst[4*x+3] = 255;
+            if (visualizeAlpha) {
+                uint8_t alpha = src[4*x+3];
+                dst[4*x] = alpha; dst[4*x+1] = alpha;
+                dst[4*x+2] = alpha; dst[4*x+3] = 255;
+            } else {
+                dst[4*x] = src[4*x+2]; dst[4*x+1] = src[4*x+1];
+                dst[4*x+2] = src[4*x]; dst[4*x+3] = 255;
+            }
         }
         if (!pending) { dirtyFirst = dirtyLast = y; pending = true; }
         else { dirtyFirst = std::min(dirtyFirst, y); dirtyLast = std::max(dirtyLast, y); }
+    }
+    if (forceFullFrame) {
+        pending = true; dirtyFirst = 0; dirtyLast = height - 1;
     }
     havePost = true;
 }

@@ -6,6 +6,16 @@ struct LibrarySettingsView: View {
     let running: Bool
     @State private var ramInput = ""
     @State private var ramError: String?
+    @AppStorage("graphics.diag.cpuReverseBlit") private var diagCPUReverseBlit = false
+    @AppStorage("graphics.diag.disableSharedImageFinish") private var diagDisableSharedImageFinish = false
+    @AppStorage("graphics.diag.advertiseDiscard") private var diagAdvertiseDiscard = false
+    @AppStorage("graphics.diag.advertisePreserved") private var diagAdvertisePreserved = false
+    @AppStorage("graphics.diag.clearPbufferOnAttach") private var diagClearPbufferOnAttach = false
+    @AppStorage("graphics.diag.disableEGLImagePreserved") private var diagDisableEGLImagePreserved = false
+    @AppStorage("graphics.diag.nearestColorBuffer") private var diagNearestColorBuffer = false
+    @AppStorage("graphics.diag.dropEGLImageOnOrphan") private var diagDropEGLImageOnOrphan = false
+    @AppStorage("graphics.diag.forceFullHostFrame") private var diagForceFullHostFrame = false
+    @AppStorage("graphics.diag.visualizeAlpha") private var diagVisualizeAlpha = false
     var body: some View {
         List {
             Section("VM Settings") {
@@ -42,6 +52,39 @@ struct LibrarySettingsView: View {
                 Text("高さは端末の比率に合わせ、全画面に拡大します。360 pxは540 pxに比べ描画画素数を約56%削減します。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
+            Section {
+                Toggle("reverse EGLImageをCPUコピーに置換", isOn: $diagCPUReverseBlit)
+                Toggle("共有EGLImageのglFinish同期を無効化", isOn: $diagDisableSharedImageFinish)
+                Toggle("GL_EXT_discard_framebufferを広告", isOn: $diagAdvertiseDiscard)
+                Toggle("preserved swapを対応扱いにする", isOn: $diagAdvertisePreserved)
+                Toggle("ColorBuffer切替時にマゼンタクリア", isOn: $diagClearPbufferOnAttach)
+                Toggle("EGL_IMAGE_PRESERVEDを付けない", isOn: $diagDisableEGLImagePreserved)
+                Toggle("ColorBufferの拡大縮小をNEARESTにする", isOn: $diagNearestColorBuffer)
+                Toggle("EGLImage orphan時に参照を破棄", isOn: $diagDropEGLImageOnOrphan)
+                Toggle("host出力を毎回全画面更新", isOn: $diagForceFullHostFrame)
+                Toggle("最終ColorBufferのαを白黒表示", isOn: $diagVisualizeAlpha)
+                if diagClearPbufferOnAttach {
+                    Text("マゼンタが残る場所は、そのColorBuffer切替後にAndroidが再描画していない領域です。半透明部分がマゼンタと混ざる場合はdirty-region / preserved-buffer経路が強く疑われます。")
+                        .font(.footnote).foregroundStyle(.pink)
+                }
+                Button("描画診断をすべてOFF") {
+                    diagCPUReverseBlit = false
+                    diagDisableSharedImageFinish = false
+                    diagAdvertiseDiscard = false
+                    diagAdvertisePreserved = false
+                    diagClearPbufferOnAttach = false
+                    diagDisableEGLImagePreserved = false
+                    diagNearestColorBuffer = false
+                    diagDropEGLImageOnOrphan = false
+                    diagForceFullHostFrame = false
+                    diagVisualizeAlpha = false
+                }
+            } header: {
+                Text("描画診断")
+            } footer: {
+                Text("各項目は独立した切り分け用です。原則1項目ずつONにしてください。設定は次回のAndroid起動時に反映されます。α白黒表示は画面を診断画像へ置き換えます。")
+            }
+            .disabled(running)
             Section("JIT") {
                 LabeledContent("Status", value: jit.state.rawValue)
                 LabeledContent("TXM", value: jit.txm.label)

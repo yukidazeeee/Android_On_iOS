@@ -1,0 +1,494 @@
+# Android_On_iOS runtime graphics diagnostics
+# Base commit: d074f6cb510fa4eb4230ef065d641310ea601d6a
+# All diagnostic switches are controlled from the in-app settings screen.
+#
+diff --git a/scripts/build_qemu_ios.sh b/scripts/build_qemu_ios.sh
+--- a/scripts/build_qemu_ios.sh
++++ b/scripts/build_qemu_ios.sh
+@@ -55,7 +55,6 @@ cmake -S ThirdParty/EmuGL -B build/emugl-ios -G Ninja \
+   -DCMAKE_C_COMPILER="$ios_cc" -DCMAKE_CXX_COMPILER="$ios_cxx" \
+   -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$ios_prefix" \
+   -DANGLE_GLES_LIBRARY:FILEPATH="$ios_prefix/lib/libGLESv2.dylib" \
+-  -DEMUGL_FORCE_CPU_COLORBUFFER_BLIT=ON \
+   -DCMAKE_PREFIX_PATH="$ios_prefix" -DEMUGEN="$repo_dir/build/emugl-generator/emugen"
+ cmake --build build/emugl-ios --parallel "$build_jobs"
+ cmake --install build/emugl-ios
+diff --git a/App/LibrarySettingsView.swift b/App/LibrarySettingsView.swift
+--- a/App/LibrarySettingsView.swift
++++ b/App/LibrarySettingsView.swift
+@@ -6,6 +6,16 @@ struct LibrarySettingsView: View {
+     let running: Bool
+     @State private var ramInput = ""
+     @State private var ramError: String?
++    @AppStorage("graphics.diag.cpuReverseBlit") private var diagCPUReverseBlit = false
++    @AppStorage("graphics.diag.disableSharedImageFinish") private var diagDisableSharedImageFinish = false
++    @AppStorage("graphics.diag.advertiseDiscard") private var diagAdvertiseDiscard = false
++    @AppStorage("graphics.diag.advertisePreserved") private var diagAdvertisePreserved = false
++    @AppStorage("graphics.diag.clearPbufferOnAttach") private var diagClearPbufferOnAttach = false
++    @AppStorage("graphics.diag.disableEGLImagePreserved") private var diagDisableEGLImagePreserved = false
++    @AppStorage("graphics.diag.nearestColorBuffer") private var diagNearestColorBuffer = false
++    @AppStorage("graphics.diag.dropEGLImageOnOrphan") private var diagDropEGLImageOnOrphan = false
++    @AppStorage("graphics.diag.forceFullHostFrame") private var diagForceFullHostFrame = false
++    @AppStorage("graphics.diag.visualizeAlpha") private var diagVisualizeAlpha = false
+     var body: some View {
+         List {
+             Section("VM Settings") {
+@@ -39,6 +49,39 @@ struct LibrarySettingsView: View {
+                 Text("高さは端末の比率に合わせ、全画面に拡大します。360 pxは540 pxに比べ描画画素数を約56%削減します。")
+                     .font(.footnote).foregroundStyle(.secondary)
+             }
++            Section {
++                Toggle("reverse EGLImageをCPUコピーに置換", isOn: $diagCPUReverseBlit)
++                Toggle("共有EGLImageのglFinish同期を無効化", isOn: $diagDisableSharedImageFinish)
++                Toggle("GL_EXT_discard_framebufferを広告", isOn: $diagAdvertiseDiscard)
++                Toggle("preserved swapを対応扱いにする", isOn: $diagAdvertisePreserved)
++                Toggle("ColorBuffer切替時にマゼンタクリア", isOn: $diagClearPbufferOnAttach)
++                Toggle("EGL_IMAGE_PRESERVEDを付けない", isOn: $diagDisableEGLImagePreserved)
++                Toggle("ColorBufferの拡大縮小をNEARESTにする", isOn: $diagNearestColorBuffer)
++                Toggle("EGLImage orphan時に参照を破棄", isOn: $diagDropEGLImageOnOrphan)
++                Toggle("host出力を毎回全画面更新", isOn: $diagForceFullHostFrame)
++                Toggle("最終ColorBufferのαを白黒表示", isOn: $diagVisualizeAlpha)
++                if diagClearPbufferOnAttach {
++                    Text("マゼンタが残る場所は、そのColorBuffer切替後にAndroidが再描画していない領域です。半透明部分がマゼンタと混ざる場合はdirty-region / preserved-buffer経路が強く疑われます。")
++                        .font(.footnote).foregroundStyle(.pink)
++                }
++                Button("描画診断をすべてOFF") {
++                    diagCPUReverseBlit = false
++                    diagDisableSharedImageFinish = false
++                    diagAdvertiseDiscard = false
++                    diagAdvertisePreserved = false
++                    diagClearPbufferOnAttach = false
++                    diagDisableEGLImagePreserved = false
++                    diagNearestColorBuffer = false
++                    diagDropEGLImageOnOrphan = false
++                    diagForceFullHostFrame = false
++                    diagVisualizeAlpha = false
++                }
++            } header: {
++                Text("描画診断")
++            } footer: {
++                Text("各項目は独立した切り分け用です。原則1項目ずつONにしてください。設定は次回のAndroid起動時に反映されます。α白黒表示は画面を診断画像へ置き換えます。")
++            }
++            .disabled(running)
+             Section("JIT") {
+                 LabeledContent("Status", value: jit.state.rawValue)
+                 LabeledContent("TXM", value: jit.txm.label)
+diff --git a/QEMUBridge/VMController.mm b/QEMUBridge/VMController.mm
+--- a/QEMUBridge/VMController.mm
++++ b/QEMUBridge/VMController.mm
+@@ -8,6 +8,8 @@
+ #include "Network/GuestNetwork.hpp"
+ #include "Core/Text/UTF8.hpp"
+ #include <dlfcn.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <sys/stat.h>
+ #include <vector>
+ #include <string>
+@@ -31,4 +33,34 @@ static std::string optionPath(NSString *path) {
+     for (char c : std::string(path.UTF8String)) { result += c; if (c == ',') result += ','; }
+     return result;
+ }
++static void setGraphicsDiagnostic(NSUserDefaults *defaults, NSString *key, const char *name) {
++    if ([defaults boolForKey:key]) setenv(name, "1", 1);
++    else unsetenv(name);
++}
++static void applyGraphicsDiagnosticEnvironment() {
++    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
++    setGraphicsDiagnostic(defaults, @"graphics.diag.cpuReverseBlit", "AE_DIAG_CPU_REVERSE_BLIT");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.disableSharedImageFinish", "AE_DIAG_DISABLE_SHARED_IMAGE_FINISH");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.advertiseDiscard", "AE_DIAG_ADVERTISE_DISCARD");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.advertisePreserved", "AE_DIAG_ADVERTISE_PRESERVED");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.clearPbufferOnAttach", "AE_DIAG_CLEAR_PBUFFER_ON_ATTACH");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.disableEGLImagePreserved", "AE_DIAG_DISABLE_EGLIMAGE_PRESERVED");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.nearestColorBuffer", "AE_DIAG_NEAREST_COLORBUFFER_FILTER");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.dropEGLImageOnOrphan", "AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.forceFullHostFrame", "AE_DIAG_FORCE_FULL_HOST_FRAME");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.visualizeAlpha", "AE_DIAG_VISUALIZE_ALPHA");
++    fprintf(stderr,
++            "AEGFXDIAG cpu=%d noFinish=%d discard=%d preserved=%d clearAttach=%d "
++            "noImagePreserve=%d nearest=%d dropOrphan=%d fullHost=%d alpha=%d\n",
++            getenv("AE_DIAG_CPU_REVERSE_BLIT") != nullptr,
++            getenv("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH") != nullptr,
++            getenv("AE_DIAG_ADVERTISE_DISCARD") != nullptr,
++            getenv("AE_DIAG_ADVERTISE_PRESERVED") != nullptr,
++            getenv("AE_DIAG_CLEAR_PBUFFER_ON_ATTACH") != nullptr,
++            getenv("AE_DIAG_DISABLE_EGLIMAGE_PRESERVED") != nullptr,
++            getenv("AE_DIAG_NEAREST_COLORBUFFER_FILTER") != nullptr,
++            getenv("AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN") != nullptr,
++            getenv("AE_DIAG_FORCE_FULL_HOST_FRAME") != nullptr,
++            getenv("AE_DIAG_VISUALIZE_ALPHA") != nullptr);
++}
+ @implementation AEVMController {
+@@ -181,5 +209,6 @@ static std::string optionPath(NSString *path) {
+             _statusText = [NSString stringWithFormat:@"保存イメージが不正です: %@", name]; return NO;
+         }
+     }
++    applyGraphicsDiagnosticEnvironment();
+     if (!_library) _library = dlopen([self enginePath].fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+     if (!_library) { const char *reason = dlerror(); _statusText = [NSString stringWithFormat:@"QEMU frameworkを読み込めません: %s", reason ?: "unknown loader error"]; return NO; }
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/GraphicsDiagnostics.h b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/GraphicsDiagnostics.h
+new file mode 100644
+--- /dev/null
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/GraphicsDiagnostics.h
+@@ -0,0 +1,10 @@
++#ifndef ANDROIDEMU_GRAPHICS_DIAGNOSTICS_H
++#define ANDROIDEMU_GRAPHICS_DIAGNOSTICS_H
++
++#include <stdlib.h>
++inline bool aeGraphicsDiagEnabled(const char *name) {
++    const char *value = getenv(name);
++    return value && value[0] == '1' && value[1] == '\0';
++}
++
++#endif
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp
+@@ -16,6 +16,7 @@
+ #include "ColorBuffer.h"
+ 
+ #include "EGLDispatch.h"
++#include "GraphicsDiagnostics.h"
+ #include "GLESv1Dispatch.h"
+ #include "GLcommon/GLutils.h"
+ #include "GLESv2Dispatch.h"
+@@ -143,6 +144,8 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
+                          zBuff);
+ 
+-    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    const GLint colorFilter = aeGraphicsDiagEnabled("AE_DIAG_NEAREST_COLORBUFFER_FILTER")
++            ? GL_NEAREST : GL_LINEAR;
++    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, colorFilter);
++    s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, colorFilter);
+     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+@@ -180,8 +183,11 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
+ 
+     if (has_eglimage_texture_2d) {
+-        // Image creation may discard the source pixels unless preservation is
+-        // explicit. Both buffers can be observed before the first full redraw.
+-        const EGLint imageAttributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
++        const EGLint preservedImageAttributes[] = {
++            EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE
++        };
++        const EGLint defaultImageAttributes[] = {EGL_NONE};
++        const EGLint *imageAttributes = aeGraphicsDiagEnabled("AE_DIAG_DISABLE_EGLIMAGE_PRESERVED")
++                ? defaultImageAttributes : preservedImageAttributes;
+         cb->m_eglImage = s_egl.eglCreateImageKHR(
+                 p_display,
+                 s_egl.eglGetCurrentContext(),
+@@ -204,7 +210,8 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
+     }
+ #ifdef AE_SYNC_SHARED_IMAGES
+-    // Publish initialized shared storage before another context imports it.
+-    s_gles2.glFinish();
++    if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
++        s_gles2.glFinish();
++    }
+ #endif
+     return cb;
+ }
+@@ -272,5 +280,7 @@ void ColorBuffer::subUpdate(int x,
+             GL_TEXTURE_2D, 0, x, y, width, height, p_format, p_type, pixels);
+ #ifdef AE_SYNC_SHARED_IMAGES
+-    s_gles2.glFinish(); // CPU uploads become visible to guest image consumers.
++    if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
++        s_gles2.glFinish();
++    }
+ #endif
+ 
+@@ -286,6 +296,10 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
+         return false;
+     }
+ 
+-#ifdef AE_FORCE_CPU_COLORBUFFER_BLIT
++    bool useCpuReverseBlit = aeGraphicsDiagEnabled("AE_DIAG_CPU_REVERSE_BLIT");
++#ifdef AE_FORCE_CPU_COLORBUFFER_BLIT
++    useCpuReverseBlit = true;
++#endif
++    if (useCpuReverseBlit) {
+     // Diagnostic path: bypass only the reverse EGLImage handoff.
+     // The forward m_tex -> m_eglImage path remains enabled for gralloc/WebView.
+@@ -365,6 +380,6 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
+     s_gles2.glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+     s_gles2.glActiveTexture(static_cast<GLenum>(previousActiveTexture));
+     return true;
+-#else
++    } else {
+     // Normal path: copy the guest window framebuffer into the reverse EGLImage.
+     // Keep the temporary EGLImage target alive until the producer commands have
+@@ -389,6 +404,8 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
+         s_gles2.glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                     m_width, m_height);
+ #ifdef AE_SYNC_SHARED_IMAGES
+-        s_gles2.glFinish();
++        if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
++            s_gles2.glFinish();
++        }
+ #endif
+         s_gles2.glBindTexture(GL_TEXTURE_2D, currTexBind);
+@@ -406,6 +423,8 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
+         s_gles1.glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                     m_width, m_height);
+ #ifdef AE_SYNC_SHARED_IMAGES
+-        s_gles1.glFinish();
++        if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
++            s_gles1.glFinish();
++        }
+ #endif
+         s_gles1.glBindTexture(GL_TEXTURE_2D, currTexBind);
+@@ -426,6 +445,8 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
+ 
+     bool drawn = m_helper->getTextureDraw()->draw(m_blitTex, 0.);
+ #ifdef AE_SYNC_SHARED_IMAGES
+-    s_gles2.glFinish();
++    if (!aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH")) {
++        s_gles2.glFinish();
++    }
+ #endif
+ 
+@@ -434,4 +455,4 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
+     unbindFbo();
+     return drawn;
+-#endif
++    }
+ }
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FbConfig.cpp b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FbConfig.cpp
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FbConfig.cpp
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FbConfig.cpp
+@@ -14,5 +14,6 @@
+ #include "FbConfig.h"
+ 
+ #include "EGLDispatch.h"
++#include "GraphicsDiagnostics.h"
+ 
+ #include <stdio.h>
+@@ -95,7 +96,11 @@ FbConfig::FbConfig(EGLConfig hostConfig, EGLDisplay hostDisplay) :
+         // so never advertise EGL_SWAP_BEHAVIOR_PRESERVED_BIT to the guest.
+         if (kConfigAttributes[i] == EGL_SURFACE_TYPE) {
+             mAttribValues[i] |= EGL_WINDOW_BIT;
+-            mAttribValues[i] &= ~EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
++            if (aeGraphicsDiagEnabled("AE_DIAG_ADVERTISE_PRESERVED")) {
++                mAttribValues[i] |= EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
++            } else {
++                mAttribValues[i] &= ~EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
++            }
+         }
+     }
+ }
+@@ -170,5 +175,10 @@ int FbConfigList::chooseConfig(const EGLint* attribs,
+                     EGLint translated = value;
+                     translated &= ~EGL_WINDOW_BIT;
+                     translated |= EGL_PBUFFER_BIT;
++                    if (aeGraphicsDiagEnabled("AE_DIAG_ADVERTISE_PRESERVED")) {
++                        // Diagnostic legacy behavior: let the host choose a plain
++                        // pbuffer while telling the guest the contents are preserved.
++                        translated &= ~EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
++                    }
+                     hostAttribs.push_back(translated);
+                 }
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/RenderControl.cpp b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/RenderControl.cpp
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/RenderControl.cpp
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/RenderControl.cpp
+@@ -16,4 +16,5 @@
+ 
+ #include "FbConfig.h"
+ #include "FrameBuffer.h"
++#include "GraphicsDiagnostics.h"
+ #include "EGLDispatch.h"
+@@ -103,14 +104,17 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
+             "GL_OES_vertex_half_float", "GL_OES_vertex_array_object",
+             "GL_EXT_texture_format_BGRA8888", "GL_EXT_read_format_bgra",
+             "GL_EXT_texture_filter_anisotropic", "GL_EXT_blend_minmax",
+-#ifndef AE_ANGLE_METAL
+             "GL_EXT_discard_framebuffer",
+-#endif
+             "GL_EXT_texture_compression_s3tc",
+             "GL_OES_compressed_ETC1_RGB8_texture"
+         };
+         std::istringstream extensions(str); std::string extension;
+         while (extensions >> extension) {
+-            if (supported.count(extension)) { if (!filtered.empty()) filtered += ' '; filtered += extension; }
++            bool allowed = supported.count(extension) != 0;
++#ifdef AE_ANGLE_METAL
++            if (extension == "GL_EXT_discard_framebuffer" &&
++                !aeGraphicsDiagEnabled("AE_DIAG_ADVERTISE_DISCARD")) allowed = false;
++#endif
++            if (allowed) { if (!filtered.empty()) filtered += ' '; filtered += extension; }
+         }
+         str = filtered.c_str();
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.h b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.h
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.h
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.h
+@@ -48,4 +48,8 @@ public:
+     // dimensions. Potentially losing pixel values in the process.
+     void setColorBuffer(ColorBufferPtr p_colorBuffer);
+ 
++    // Poison newly attached backing storage with magenta when requested.
++    // Undrawn/preserved regions then become visually obvious.
++    void applyDiagnosticAttachClear();
++
+     // Copy the Pbuffer's pixels to the attached color buffer.
+@@ -92,4 +96,5 @@ private:
+     GLuint mHeight;
+     EGLConfig mConfig;
+     EGLDisplay mDisplay;
++    bool mDiagnosticClearPending;
+ };
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp
+@@ -17,7 +17,10 @@
+ 
+ #include "FbConfig.h"
+ #include "EGLDispatch.h"
++#include "GraphicsDiagnostics.h"
+ #include "GLErrorLog.h"
++#include "GLESv1Dispatch.h"
++#include "GLESv2Dispatch.h"
+ 
+ #include <GLES/glext.h>
+ 
+@@ -34,7 +37,8 @@
+         mWidth(0),
+         mHeight(0),
+         mConfig(config),
+-        mDisplay(display) {}
++        mDisplay(display),
++        mDiagnosticClearPending(false) {}
+ 
+ WindowSurface::~WindowSurface() {
+     s_egl.eglDestroySurface(mDisplay, mSurface);
+@@ -72,6 +76,39 @@
+     if (cbWidth != mWidth || cbHeight != mHeight) {
+         resize(cbWidth, cbHeight);
+     }
++    mDiagnosticClearPending =
++            aeGraphicsDiagEnabled("AE_DIAG_CLEAR_PBUFFER_ON_ATTACH");
++    applyDiagnosticAttachClear();
++}
++
++void WindowSurface::applyDiagnosticAttachClear() {
++    if (!mDiagnosticClearPending || !mDrawContext.Ptr() ||
++        s_egl.eglGetCurrentSurface(EGL_DRAW) != mSurface) {
++        return;
++    }
++
++    GLint viewport[4] = {0, 0, 0, 0};
++    GLfloat clearColor[4] = {0, 0, 0, 0};
++
++    if (mDrawContext->isGL2()) {
++        s_gles2.glGetIntegerv(GL_VIEWPORT, viewport);
++        s_gles2.glGetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
++        s_gles2.glViewport(0, 0, mWidth, mHeight);
++        s_gles2.glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
++        s_gles2.glClear(GL_COLOR_BUFFER_BIT);
++        s_gles2.glClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
++        s_gles2.glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++    } else {
++        s_gles1.glGetIntegerv(GL_VIEWPORT, viewport);
++        s_gles1.glGetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
++        s_gles1.glViewport(0, 0, mWidth, mHeight);
++        s_gles1.glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
++        s_gles1.glClear(GL_COLOR_BUFFER_BIT);
++        s_gles1.glClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
++        s_gles1.glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++    }
++
++    mDiagnosticClearPending = false;
+ }
+ 
+ void WindowSurface::bind(RenderContextPtr p_ctx, BindType p_bindType) {
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp
+@@ -800,4 +800,5 @@ bool FrameBuffer::bindContext(HandleType p_context,
+         else {
+             bindDraw->bind(ctx, WindowSurface::BIND_READDRAW);
+         }
++        bindDraw->applyDiagnosticAttachClear();
+     }
+diff --git a/ThirdParty/EmuGL/Bridge.cpp b/ThirdParty/EmuGL/Bridge.cpp
+--- a/ThirdParty/EmuGL/Bridge.cpp
++++ b/ThirdParty/EmuGL/Bridge.cpp
+@@ -1,3 +1,4 @@
+ #include "Bridge.h"
+ #include "FrameBuffer.h"
++#include "GraphicsDiagnostics.h"
+ #include "RenderThread.h"
+@@ -19,19 +20,32 @@ std::vector<uint8_t> rgba;
+ void post(void *, int w, int h, int direction, int format, int type, unsigned char *pixels) {
+     (void)direction; // ColorBuffer blit already converts GL coordinates to gralloc top-left rows.
+     if (w != int(width) || h != int(height) || format != 0x1908 || type != 0x1401 || !pixels) return;
++    const bool visualizeAlpha = aeGraphicsDiagEnabled("AE_DIAG_VISUALIZE_ALPHA");
++    const bool forceFullFrame =
++            visualizeAlpha || aeGraphicsDiagEnabled("AE_DIAG_FORCE_FULL_HOST_FRAME");
+     std::lock_guard<std::mutex> lock(frameLock);
+     for (unsigned y = 0; y < height; ++y) {
+         const uint8_t *src = pixels + size_t(y) * width * 4;
+         uint8_t *previous = rgba.data() + size_t(y) * width * 4;
+-        if (havePost && !memcmp(previous, src, size_t(width) * 4)) continue;
++        if (!forceFullFrame && havePost &&
++            !memcmp(previous, src, size_t(width) * 4)) continue;
+         memcpy(previous, src, size_t(width) * 4);
+         uint8_t *dst = frame.data() + size_t(y) * width * 4;
+         for (unsigned x = 0; x < width; ++x) {
+-            dst[4*x] = src[4*x+2]; dst[4*x+1] = src[4*x+1];
+-            dst[4*x+2] = src[4*x]; dst[4*x+3] = 255;
++            if (visualizeAlpha) {
++                uint8_t alpha = src[4*x+3];
++                dst[4*x] = alpha; dst[4*x+1] = alpha;
++                dst[4*x+2] = alpha; dst[4*x+3] = 255;
++            } else {
++                dst[4*x] = src[4*x+2]; dst[4*x+1] = src[4*x+1];
++                dst[4*x+2] = src[4*x]; dst[4*x+3] = 255;
++            }
+         }
+         if (!pending) { dirtyFirst = dirtyLast = y; pending = true; }
+         else { dirtyFirst = std::min(dirtyFirst, y); dirtyLast = std::max(dirtyLast, y); }
+     }
++    if (forceFullFrame) {
++        pending = true; dirtyFirst = 0; dirtyLast = height - 1;
++    }
+     havePost = true;
+ }
+diff --git a/scripts/angle_metal_image.py b/scripts/angle_metal_image.py
+--- a/scripts/angle_metal_image.py
++++ b/scripts/angle_metal_image.py
+@@ -5,4 +5,7 @@ Only advertise the texture-2D source target implemented here.
+ BASE = 'Source/ThirdParty/ANGLE/src/libANGLE/renderer/metal/'
+ REPLACEMENTS = [
++    (BASE + 'ImageMtl.mm',
++     '#include "libANGLE/renderer/metal/ImageMtl.h"',
++     '#include "libANGLE/renderer/metal/ImageMtl.h"\\n\\n#include <cstdlib>'),
+     (BASE + 'DisplayMtl.mm',
+      '    outExtensions->imageBase = true;',
+@@ -54,13 +58,21 @@ REPLACEMENTS = [
+      '''    if (sibling == mState.source)
+     {
+         mNativeTexture = nullptr;
+     }''',
+-     '''    // EGLImage siblings keep their exported TextureRef when the source GL
+-    // texture is deleted or respecified. Do not mutate TextureMtl here: the
+-    // old Metal storage remains alive until ImageMtl/onDestroy releases it.
++     '''    // Runtime diagnostic: normally GL texture EGLImages keep their exported
++    // TextureRef across source orphaning. Optionally drop it to test whether
++    // stale exported Metal storage is involved in a rendering artifact.
+     (void)context;
+-    if (sibling == mState.source && mState.target != EGL_GL_TEXTURE_2D_KHR)
++    if (sibling == mState.source)
+     {
+-        mNativeTexture = nullptr;
++        if (mState.target == EGL_GL_TEXTURE_2D_KHR)
++        {
++            if (std::getenv("AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN"))
++                mNativeTexture = nullptr;
++        }
++        else
++        {
++            mNativeTexture = nullptr;
++        }
+     }'''),
+ ]

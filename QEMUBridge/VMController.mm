@@ -8,6 +8,8 @@
 #include "Network/GuestNetwork.hpp"
 #include "Core/Text/UTF8.hpp"
 #include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <vector>
 #include <string>
@@ -31,6 +33,36 @@ static std::string optionPath(NSString *path) {
     std::string result;
     for (char c : std::string(path.UTF8String)) { result += c; if (c == ',') result += ','; }
     return result;
+}
+static void setGraphicsDiagnostic(NSUserDefaults *defaults, NSString *key, const char *name) {
+    if ([defaults boolForKey:key]) setenv(name, "1", 1);
+    else unsetenv(name);
+}
+static void applyGraphicsDiagnosticEnvironment() {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    setGraphicsDiagnostic(defaults, @"graphics.diag.cpuReverseBlit", "AE_DIAG_CPU_REVERSE_BLIT");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.disableSharedImageFinish", "AE_DIAG_DISABLE_SHARED_IMAGE_FINISH");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.advertiseDiscard", "AE_DIAG_ADVERTISE_DISCARD");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.advertisePreserved", "AE_DIAG_ADVERTISE_PRESERVED");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.clearPbufferOnAttach", "AE_DIAG_CLEAR_PBUFFER_ON_ATTACH");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.disableEGLImagePreserved", "AE_DIAG_DISABLE_EGLIMAGE_PRESERVED");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.nearestColorBuffer", "AE_DIAG_NEAREST_COLORBUFFER_FILTER");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.dropEGLImageOnOrphan", "AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.forceFullHostFrame", "AE_DIAG_FORCE_FULL_HOST_FRAME");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.visualizeAlpha", "AE_DIAG_VISUALIZE_ALPHA");
+    fprintf(stderr,
+            "AEGFXDIAG cpu=%d noFinish=%d discard=%d preserved=%d clearAttach=%d "
+            "noImagePreserve=%d nearest=%d dropOrphan=%d fullHost=%d alpha=%d\n",
+            getenv("AE_DIAG_CPU_REVERSE_BLIT") != nullptr,
+            getenv("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH") != nullptr,
+            getenv("AE_DIAG_ADVERTISE_DISCARD") != nullptr,
+            getenv("AE_DIAG_ADVERTISE_PRESERVED") != nullptr,
+            getenv("AE_DIAG_CLEAR_PBUFFER_ON_ATTACH") != nullptr,
+            getenv("AE_DIAG_DISABLE_EGLIMAGE_PRESERVED") != nullptr,
+            getenv("AE_DIAG_NEAREST_COLORBUFFER_FILTER") != nullptr,
+            getenv("AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN") != nullptr,
+            getenv("AE_DIAG_FORCE_FULL_HOST_FRAME") != nullptr,
+            getenv("AE_DIAG_VISUALIZE_ALPHA") != nullptr);
 }
 @implementation AEVMController {
     AEMetalDisplay *_display;
@@ -179,6 +211,7 @@ static std::string optionPath(NSString *path) {
             _statusText = [NSString stringWithFormat:@"保存イメージが不正です: %@", name]; return NO;
         }
     }
+    applyGraphicsDiagnosticEnvironment();
     if (!_library) _library = dlopen([self enginePath].fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
     if (!_library) { const char *reason = dlerror(); _statusText = [NSString stringWithFormat:@"QEMU frameworkを読み込めません: %s", reason ?: "unknown loader error"]; return NO; }
     NSMutableArray<NSString *> *missing = [NSMutableArray array];

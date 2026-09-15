@@ -17,7 +17,10 @@
 
 #include "FbConfig.h"
 #include "EGLDispatch.h"
+#include "GraphicsDiagnostics.h"
 #include "GLErrorLog.h"
+#include "GLESv1Dispatch.h"
+#include "GLESv2Dispatch.h"
 
 #include <GLES/glext.h>
 
@@ -34,7 +37,8 @@ WindowSurface::WindowSurface(EGLDisplay display,
         mWidth(0),
         mHeight(0),
         mConfig(config),
-        mDisplay(display) {}
+        mDisplay(display),
+        mDiagnosticClearPending(false) {}
 
 WindowSurface::~WindowSurface() {
     s_egl.eglDestroySurface(mDisplay, mSurface);
@@ -72,6 +76,39 @@ void WindowSurface::setColorBuffer(ColorBufferPtr p_colorBuffer) {
     if (cbWidth != mWidth || cbHeight != mHeight) {
         resize(cbWidth, cbHeight);
     }
+    mDiagnosticClearPending =
+            aeGraphicsDiagEnabled("AE_DIAG_CLEAR_PBUFFER_ON_ATTACH");
+    applyDiagnosticAttachClear();
+}
+
+void WindowSurface::applyDiagnosticAttachClear() {
+    if (!mDiagnosticClearPending || !mDrawContext.Ptr() ||
+        s_egl.eglGetCurrentSurface(EGL_DRAW) != mSurface) {
+        return;
+    }
+
+    GLint viewport[4] = {0, 0, 0, 0};
+    GLfloat clearColor[4] = {0, 0, 0, 0};
+
+    if (mDrawContext->isGL2()) {
+        s_gles2.glGetIntegerv(GL_VIEWPORT, viewport);
+        s_gles2.glGetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
+        s_gles2.glViewport(0, 0, mWidth, mHeight);
+        s_gles2.glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+        s_gles2.glClear(GL_COLOR_BUFFER_BIT);
+        s_gles2.glClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+        s_gles2.glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    } else {
+        s_gles1.glGetIntegerv(GL_VIEWPORT, viewport);
+        s_gles1.glGetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
+        s_gles1.glViewport(0, 0, mWidth, mHeight);
+        s_gles1.glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+        s_gles1.glClear(GL_COLOR_BUFFER_BIT);
+        s_gles1.glClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+        s_gles1.glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    }
+
+    mDiagnosticClearPending = false;
 }
 
 void WindowSurface::bind(RenderContextPtr p_ctx, BindType p_bindType) {

@@ -6,6 +6,9 @@ Only advertise the texture-2D source target implemented here.
 """
 BASE = 'Source/ThirdParty/ANGLE/src/libANGLE/renderer/metal/'
 REPLACEMENTS = [
+    (BASE + 'ImageMtl.mm',
+     '#include "libANGLE/renderer/metal/ImageMtl.h"',
+     '#include "libANGLE/renderer/metal/ImageMtl.h"\\n\\n#include <cstdlib>'),
     (BASE + 'DisplayMtl.mm',
      '    outExtensions->imageBase = true;',
      '    outExtensions->imageBase = true;\n    outExtensions->glTexture2DImage = true;'),
@@ -65,12 +68,20 @@ REPLACEMENTS = [
     {
         mNativeTexture = nullptr;
     }''',
-     '''    // EGLImage siblings keep their exported TextureRef when the source GL
-    // texture is deleted or respecified. Do not mutate TextureMtl here: the
-    // old Metal storage remains alive until ImageMtl/onDestroy releases it.
+     '''    // Runtime diagnostic: normally GL texture EGLImages keep their exported
+    // TextureRef across source orphaning. Optionally drop it to test whether
+    // stale exported Metal storage is involved in a rendering artifact.
     (void)context;
-    if (sibling == mState.source && mState.target != EGL_GL_TEXTURE_2D_KHR)
+    if (sibling == mState.source)
     {
-        mNativeTexture = nullptr;
+        if (mState.target == EGL_GL_TEXTURE_2D_KHR)
+        {
+            if (std::getenv("AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN"))
+                mNativeTexture = nullptr;
+        }
+        else
+        {
+            mNativeTexture = nullptr;
+        }
     }'''),
 ]

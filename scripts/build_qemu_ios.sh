@@ -55,7 +55,6 @@ cmake -S ThirdParty/EmuGL -B build/emugl-ios -G Ninja \
   -DCMAKE_C_COMPILER="$ios_cc" -DCMAKE_CXX_COMPILER="$ios_cxx" \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$ios_prefix" \
   -DANGLE_GLES_LIBRARY:FILEPATH="$ios_prefix/lib/libGLESv2.dylib" \
-  -DEMUGL_FORCE_CPU_COLORBUFFER_BLIT=ON \
   -DCMAKE_PREFIX_PATH="$ios_prefix" -DEMUGEN="$repo_dir/build/emugl-generator/emugen"
 cmake --build build/emugl-ios --parallel "$build_jobs"
 cmake --install build/emugl-ios

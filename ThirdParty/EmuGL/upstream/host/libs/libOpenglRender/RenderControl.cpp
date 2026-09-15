@@ -17,6 +17,7 @@
 
 #include "FbConfig.h"
 #include "FrameBuffer.h"
+#include "GraphicsDiagnostics.h"
 #include "EGLDispatch.h"
 #include "GLESv2Dispatch.h"
 #include "GLESv1Dispatch.h"
@@ -120,15 +121,18 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
             "GL_OES_vertex_half_float", "GL_OES_vertex_array_object",
             "GL_EXT_texture_format_BGRA8888", "GL_EXT_read_format_bgra",
             "GL_EXT_texture_filter_anisotropic", "GL_EXT_blend_minmax",
-#ifndef AE_ANGLE_METAL
             "GL_EXT_discard_framebuffer",
-#endif
             "GL_EXT_texture_compression_s3tc",
             "GL_OES_compressed_ETC1_RGB8_texture"
         };
         std::istringstream extensions(str); std::string extension;
         while (extensions >> extension) {
-            if (supported.count(extension)) { if (!filtered.empty()) filtered += ' '; filtered += extension; }
+            bool allowed = supported.count(extension) != 0;
+#ifdef AE_ANGLE_METAL
+            if (extension == "GL_EXT_discard_framebuffer" &&
+                !aeGraphicsDiagEnabled("AE_DIAG_ADVERTISE_DISCARD")) allowed = false;
+#endif
+            if (allowed) { if (!filtered.empty()) filtered += ' '; filtered += extension; }
         }
         str = filtered.c_str();
     }

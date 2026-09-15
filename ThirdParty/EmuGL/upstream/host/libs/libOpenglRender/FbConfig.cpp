@@ -15,6 +15,7 @@
 #include "FbConfig.h"
 
 #include "EGLDispatch.h"
+#include "GraphicsDiagnostics.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -110,7 +111,11 @@ FbConfig::FbConfig(EGLConfig hostConfig, EGLDisplay hostDisplay) :
         // so never advertise EGL_SWAP_BEHAVIOR_PRESERVED_BIT to the guest.
         if (kConfigAttributes[i] == EGL_SURFACE_TYPE) {
             mAttribValues[i] |= EGL_WINDOW_BIT;
-            mAttribValues[i] &= ~EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
+            if (aeGraphicsDiagEnabled("AE_DIAG_ADVERTISE_PRESERVED")) {
+                mAttribValues[i] |= EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
+            } else {
+                mAttribValues[i] &= ~EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
+            }
         }
     }
 }
@@ -188,6 +193,11 @@ int FbConfigList::chooseConfig(const EGLint* attribs,
                     EGLint translated = value;
                     translated &= ~EGL_WINDOW_BIT;
                     translated |= EGL_PBUFFER_BIT;
+                    if (aeGraphicsDiagEnabled("AE_DIAG_ADVERTISE_PRESERVED")) {
+                        // Diagnostic legacy behavior: let the host choose a plain
+                        // pbuffer while telling the guest the contents are preserved.
+                        translated &= ~EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
+                    }
                     hostAttribs.push_back(translated);
                 }
             } else {

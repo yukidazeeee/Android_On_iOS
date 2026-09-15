@@ -842,6 +842,7 @@ bool FrameBuffer::bindContext(HandleType p_context,
         else {
             bindDraw->bind(ctx, WindowSurface::BIND_READDRAW);
         }
+        bindDraw->applyDiagnosticAttachClear();
     }
 
     //

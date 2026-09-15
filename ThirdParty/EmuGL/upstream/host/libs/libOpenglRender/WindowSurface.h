@@ -52,6 +52,10 @@ public:
     // dimensions. Potentially losing pixel values in the process.
     void setColorBuffer(ColorBufferPtr p_colorBuffer);
 
+    // Poison newly attached backing storage with magenta when requested.
+    // Undrawn/preserved regions then become visually obvious.
+    void applyDiagnosticAttachClear();
+
     // Copy the Pbuffer's pixels to the attached color buffer.
     // Returns true on success, or false on error (e.g. if there is no
     // attached color buffer).
@@ -96,6 +100,7 @@ private:
     GLuint mHeight;
     EGLConfig mConfig;
     EGLDisplay mDisplay;
+    bool mDiagnosticClearPending;
 };
 
 typedef emugl::SmartPtr<WindowSurface> WindowSurfacePtr;
