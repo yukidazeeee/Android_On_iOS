@@ -84,4 +84,54 @@ REPLACEMENTS = [
             mNativeTexture = nullptr;
         }
     }'''),
+
+    # AndroidEmu: force Metal color attachment preservation.
+    #
+    # Goldfish's guest EGL window surface is represented by one persistent host
+    # PBuffer while Android BufferQueue color buffers rotate behind it. Android
+    # UI/SF frequently performs partial redraw and blending, both of which need
+    # the previous destination pixels to remain defined. Metal's DontCare
+    # store/load actions make those pixels undefined and can surface as stale
+    # rectangular tiles. Preserve color attachments unconditionally; depth and
+    # stencil keep ANGLE's normal discard behavior.
+    (BASE + 'FrameBufferMtl.mm',
+     '''            colorAttachment.storeAction = MTLStoreActionDontCare;
+            if (renderPassStarted)
+            {
+                encoder->setColorStoreAction(MTLStoreActionDontCare, i);
+            }''',
+     '''            // AndroidEmu: force Metal color attachment preservation.
+            // Ignore color invalidation: the Goldfish host PBuffer is the
+            // persistent backing for partial redraw across guest swaps.
+            colorAttachment.storeAction = MTLStoreActionStore;
+            if (renderPassStarted)
+            {
+                encoder->setColorStoreAction(MTLStoreActionStore, i);
+            }'''),
+
+    (BASE + 'FrameBufferMtl.mm',
+     '''    // Compute loadOp based on previous storeOp and reset storeOp flags:
+    for (mtl::RenderPassColorAttachmentDesc &colorAttachment : mRenderPassDesc.colorAttachments)
+    {
+        forceDepthStencilMultisampleLoad |=
+            colorAttachment.storeAction == MTLStoreActionStoreAndMultisampleResolve;
+        setLoadStoreActionOnRenderPassFirstStart(&colorAttachment, false);
+    }''',
+     '''    // AndroidEmu: force Metal color attachment preservation.
+    // Never start a color render pass with DontCare. Transparent blending and
+    // partial redraw both consume destination pixels from the previous pass.
+    for (mtl::RenderPassColorAttachmentDesc &colorAttachment : mRenderPassDesc.colorAttachments)
+    {
+        forceDepthStencilMultisampleLoad |=
+            colorAttachment.storeAction == MTLStoreActionStoreAndMultisampleResolve;
+        colorAttachment.loadAction = MTLLoadActionLoad;
+        if (colorAttachment.hasImplicitMSTexture())
+        {
+            colorAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        }
+        else
+        {
+            colorAttachment.storeAction = MTLStoreActionStore;
+        }
+    }'''),
 ]
