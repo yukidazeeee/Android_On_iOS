@@ -27,6 +27,8 @@
 #include <EGL/egl.h>
 
 #include <map>
+#include <condition_variable>
+#include <mutex>
 
 #include <stdint.h>
 
@@ -99,6 +101,9 @@ public:
     bool  flushWindowSurfaceColorBuffer(HandleType p_surface);
     bool  bindColorBufferToTexture(HandleType p_colorbuffer);
     bool  bindColorBufferToRenderbuffer(HandleType p_colorbuffer);
+    int   colorBufferCacheFlush(HandleType p_colorbuffer,
+                                EGLint postCount,
+                                int forRead);
     void  readColorBuffer(HandleType p_colorbuffer,
                            int x, int y, int width, int height,
                            GLenum format, GLenum type, void *pixels);
@@ -142,6 +147,14 @@ private:
     RenderContextMap m_contexts;
     WindowSurfaceMap m_windows;
     ColorBufferMap m_colorbuffers;
+    // AndroidEmu sync/lifetime hardening v1
+    // Guest gralloc increments a per-buffer post counter before rcFBPost and
+    // later passes that value to rcColorBufferCacheFlush. Track completed
+    // host posts independently of m_lock so a cache-flush thread can wait
+    // without preventing the post thread from entering FrameBuffer::post().
+    std::mutex m_colorBufferPostMutex;
+    std::condition_variable m_colorBufferPostCv;
+    std::map<HandleType, uint32_t> m_colorBufferCompletedPosts;
     ColorBuffer::Helper* m_colorBufferHelper;
 
     EGLSurface m_eglSurface;

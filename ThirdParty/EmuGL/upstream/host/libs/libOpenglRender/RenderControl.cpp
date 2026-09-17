@@ -366,8 +366,11 @@ static void rcBindRenderbuffer(uint32_t colorBuffer)
 static EGLint rcColorBufferCacheFlush(uint32_t colorBuffer,
                                       EGLint postCount, int forRead)
 {
-   // XXX: TBD - should be implemented
-   return 0;
+    FrameBuffer *fb = FrameBuffer::getFB();
+    if (!fb) {
+        return -1;
+    }
+    return fb->colorBufferCacheFlush(colorBuffer, postCount, forRead);
 }
 
 static void rcReadColorBuffer(uint32_t colorBuffer,

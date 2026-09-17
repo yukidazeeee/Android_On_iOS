@@ -516,7 +516,6 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
 #endif
         s_gles2.glBindTexture(GL_TEXTURE_2D, currTexBind);
         s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, currFramebuffer);
-        s_gles2.glDeleteTextures(1, &tmpTex);
     } else {
         s_gles1.glGetIntegerv(GL_FRAMEBUFFER_BINDING_OES, &currFramebuffer);
         s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, 0);
@@ -545,11 +544,16 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
 #endif
         s_gles1.glBindTexture(GL_TEXTURE_2D, currTexBind);
         s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, currFramebuffer);
-        s_gles1.glDeleteTextures(1, &tmpTex);
     }
 
     ScopedHelperContext context(m_helper);
     if (!context.isOk()) {
+        if (tmpTex) {
+            if (tInfo->currContext->isGL2())
+                s_gles2.glDeleteTextures(1, &tmpTex);
+            else
+                s_gles1.glDeleteTextures(1, &tmpTex);
+        }
         if (sample) aeGraphicsDiagLog("REVERSE_END", "n=%llu cb=%p ok=0 helperContext",
                                       static_cast<unsigned long long>(ordinal), this);
         return false;
@@ -577,6 +581,13 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
     }
 
     if (!bindFbo(&m_fbo, m_tex)) {
+        context.release();
+        if (tmpTex) {
+            if (tInfo->currContext->isGL2())
+                s_gles2.glDeleteTextures(1, &tmpTex);
+            else
+                s_gles1.glDeleteTextures(1, &tmpTex);
+        }
         return false;
     }
 
@@ -614,6 +625,18 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
 
     s_gles2.glViewport(vport[0], vport[1], vport[2], vport[3]);
     unbindFbo();
+
+    // AndroidEmu sync/lifetime hardening v1:
+    // delete reverse EGLImage target only after helper consumption.
+    // ScopedHelperContext::release restores the original guest context first.
+    context.release();
+    if (tmpTex) {
+        if (tInfo->currContext->isGL2())
+            s_gles2.glDeleteTextures(1, &tmpTex);
+        else
+            s_gles1.glDeleteTextures(1, &tmpTex);
+    }
+
     if (sample) aeGraphicsDiagLog("REVERSE_END", "n=%llu cb=%p ok=%d path=eglimage",
                                   static_cast<unsigned long long>(ordinal), this, drawn);
     return drawn;

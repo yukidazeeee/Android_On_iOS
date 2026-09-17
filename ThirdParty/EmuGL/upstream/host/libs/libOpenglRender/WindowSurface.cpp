@@ -177,6 +177,10 @@ bool WindowSurface::flushColorBuffer() {
         return false;
     }
 
+    // The attach-time call can occur while another surface is current.
+    // Run the pending diagnostic poison now that this pbuffer is current.
+    applyDiagnosticAttachClear();
+
     bool copied = mAttachedColorBuffer->blitFromCurrentReadBuffer();
 
     // restore current context/surface

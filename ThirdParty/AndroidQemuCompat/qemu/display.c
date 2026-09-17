@@ -31,6 +31,7 @@ typedef struct GFDisplay {
     uint32_t base, status, enabled;
     bool valid, blank, invalidate, base_pending, presented, gpu_presented;
     uint8_t *scanout;
+    uint8_t *gpu_scanout; /* AndroidEmu sync/lifetime hardening v1 */
 } GFDisplay;
 static void display_irq(GFDisplay *s)
 {
@@ -54,7 +55,14 @@ static void display_update(void *opaque)
             return;
         }
         unsigned first, rows;
-        if (ae_gpu_frame_region(surface_data(surface), (size_t)GF_WIDTH * GF_HEIGHT * 4, &first, &rows)) {
+        const size_t tight_stride = (size_t)GF_WIDTH * 4;
+        const size_t tight_size = tight_stride * GF_HEIGHT;
+        if (ae_gpu_frame_region(s->gpu_scanout, tight_size, &first, &rows)) {
+            for (unsigned y = first; y < first + rows; ++y) {
+                memcpy(surface_data(surface) + (size_t)y * surface_stride(surface),
+                       s->gpu_scanout + (size_t)y * tight_stride,
+                       tight_stride);
+            }
             s->gpu_presented = true;
             dpy_gfx_update(s->console, 0, first, GF_WIDTH, rows);
             android51_host_frame(surface_data(surface), surface_stride(surface), 0, first, GF_WIDTH, rows);
@@ -163,7 +171,9 @@ static void display_reset(void *opaque)
     GFDisplay *s = opaque;
     s->base = s->status = s->enabled = 0;
     s->valid = s->blank = s->base_pending = s->presented = false;
+    s->gpu_presented = false;
     s->invalidate = true;
+    if (s->board->gpu_ready) { ae_gpu_invalidate_frame(); }
     display_irq(s);
     timer_mod(s->vsync, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
 }
@@ -172,6 +182,7 @@ void gf_display_init(Android51State *board)
     GFDisplay *s = g_new0(GFDisplay, 1);
     s->board = board;
     s->scanout = g_malloc0((size_t)GF_WIDTH * GF_HEIGHT * 2);
+    s->gpu_scanout = g_malloc0((size_t)GF_WIDTH * GF_HEIGHT * 4);
     s->console = graphic_console_init(NULL, 0, &graphic_ops, s);
     qemu_console_resize(s->console, GF_WIDTH, GF_HEIGHT);
     s->vsync = timer_new_ns(QEMU_CLOCK_VIRTUAL, display_tick, s);

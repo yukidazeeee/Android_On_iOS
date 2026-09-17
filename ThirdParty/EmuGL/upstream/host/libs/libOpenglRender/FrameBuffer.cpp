@@ -26,6 +26,7 @@
 
 #include <stdio.h>
 #include <atomic>
+#include <chrono>
 
 namespace {
 bool hasExtension(const char *extensions, const char *name) {
@@ -541,6 +542,10 @@ HandleType FrameBuffer::createColorBuffer(int p_width, int p_height,
         ret = genHandle();
         m_colorbuffers[ret].cb = cb;
         m_colorbuffers[ret].refcount = 1;
+        {
+            std::lock_guard<std::mutex> syncLock(m_colorBufferPostMutex);
+            m_colorBufferCompletedPosts[ret] = 0;
+        }
         if (aeGraphicsDiagTraceEnabled()) {
             aeGraphicsDiagLog("FB_CREATE_CB",
                               "handle=%#x cb=%p size=%dx%d format=%#x",
@@ -684,6 +689,11 @@ void FrameBuffer::closeColorBuffer(HandleType p_colorbuffer)
     }
     if (--(*c).second.refcount == 0) {
         m_colorbuffers.erase(c);
+        {
+            std::lock_guard<std::mutex> syncLock(m_colorBufferPostMutex);
+            m_colorBufferCompletedPosts.erase(p_colorbuffer);
+        }
+        m_colorBufferPostCv.notify_all();
     }
 }
 
@@ -784,6 +794,62 @@ bool FrameBuffer::updateColorBuffer(HandleType p_colorbuffer,
     (*c).second.cb->subUpdate(x, y, width, height, format, type, pixels);
 
     return true;
+}
+
+// AndroidEmu sync/lifetime hardening v1
+int FrameBuffer::colorBufferCacheFlush(HandleType p_colorbuffer,
+                                       EGLint postCount,
+                                       int forRead)
+{
+    if (postCount < 0) {
+        return -1;
+    }
+
+    // Goldfish gralloc flushes the connection that issued rcFBPost, but host
+    // RenderThreads are independent. Wait for the matching processed post
+    // without holding FrameBuffer::m_lock, otherwise the post cannot finish.
+    {
+        std::unique_lock<std::mutex> syncLock(m_colorBufferPostMutex);
+        const std::chrono::steady_clock::time_point deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            std::map<HandleType, uint32_t>::const_iterator it =
+                    m_colorBufferCompletedPosts.find(p_colorbuffer);
+            if (it == m_colorBufferCompletedPosts.end()) {
+                return -1;
+            }
+            if (it->second >= static_cast<uint32_t>(postCount)) {
+                break;
+            }
+            if (m_colorBufferPostCv.wait_until(syncLock, deadline) ==
+                std::cv_status::timeout) {
+                fprintf(stderr,
+                        "EmuGL: rcColorBufferCacheFlush timeout cb=%#x "
+                        "wantedPosts=%d completedPosts=%u forRead=%d\n",
+                        p_colorbuffer, postCount, it->second, forRead);
+                return -1;
+            }
+        }
+    }
+
+    // Finish the shared helper context after the post barrier. This makes the
+    // host-side consumer complete shared-resource work before guest gralloc
+    // reuses or CPU-reads the buffer.
+    emugl::Mutex::AutoLock mutex(m_lock);
+    ColorBufferMap::iterator c(m_colorbuffers.find(p_colorbuffer));
+    if (c == m_colorbuffers.end()) {
+        return -1;
+    }
+
+    ScopedBind bind(this);
+    if (!bind.isValid()) {
+        return -1;
+    }
+    s_gles2.glFinish();
+
+    // Conservative legacy behavior: a positive value tells gralloc to do a
+    // CPU readback. Extra readback is safe; falsely returning 0 can be stale.
+    return forRead ? 1 : 0;
 }
 
 bool FrameBuffer::bindColorBufferToTexture(HandleType p_colorbuffer)
@@ -1064,6 +1130,17 @@ bool FrameBuffer::post(HandleType p_colorbuffer, bool needLock)
     }
 
 EXIT:
+    if (ret) {
+        {
+            std::lock_guard<std::mutex> syncLock(m_colorBufferPostMutex);
+            std::map<HandleType, uint32_t>::iterator it =
+                    m_colorBufferCompletedPosts.find(p_colorbuffer);
+            if (it != m_colorBufferCompletedPosts.end()) {
+                ++it->second;
+            }
+        }
+        m_colorBufferPostCv.notify_all();
+    }
     if (needLock) {
         m_lock.unlock();
     }
