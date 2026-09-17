@@ -26,6 +26,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <atomic>
 
 
 WindowSurface::WindowSurface(EGLDisplay display,
@@ -66,7 +67,14 @@ WindowSurface *WindowSurface::create(EGLDisplay display,
 
 
 void WindowSurface::setColorBuffer(ColorBufferPtr p_colorBuffer) {
+    ColorBuffer *previous = mAttachedColorBuffer.Ptr();
     mAttachedColorBuffer = p_colorBuffer;
+    if (aeGraphicsDiagTraceEnabled()) {
+        aeGraphicsDiagLog("WIN_ATTACH_CB",
+                          "win=%p pbuffer=%p oldCb=%p newCb=%p size=%ux%u",
+                          this, mSurface, previous, mAttachedColorBuffer.Ptr(),
+                          mWidth, mHeight);
+    }
 
     // resize the window if the attached color buffer is of different
     // size.
@@ -123,7 +131,21 @@ void WindowSurface::bind(RenderContextPtr p_ctx, BindType p_bindType) {
 }
 
 bool WindowSurface::flushColorBuffer() {
+    static std::atomic<uint64_t> flushOrdinal(0);
+    const uint64_t ordinal = flushOrdinal.fetch_add(1) + 1;
+    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
+    if (sample) {
+        aeGraphicsDiagLog("WIN_FLUSH_BEGIN",
+                          "n=%llu win=%p pbuffer=%p cb=%p size=%ux%u drawCtx=%p currentCtx=%p",
+                          static_cast<unsigned long long>(ordinal), this, mSurface,
+                          mAttachedColorBuffer.Ptr(), mWidth, mHeight,
+                          mDrawContext.Ptr() ? mDrawContext->getEGLContext() : EGL_NO_CONTEXT,
+                          s_egl.eglGetCurrentContext());
+    }
     if (!mAttachedColorBuffer.Ptr()) {
+        if (sample) aeGraphicsDiagLog("WIN_FLUSH_END",
+                                     "n=%llu noColorBuffer",
+                                     static_cast<unsigned long long>(ordinal));
         return true;
     }
     if (!mWidth || !mHeight) {
@@ -159,6 +181,12 @@ bool WindowSurface::flushColorBuffer() {
 
     // restore current context/surface
     bool restored = s_egl.eglMakeCurrent(mDisplay, prevDrawSurf, prevReadSurf, prevContext);
+    if (sample) {
+        aeGraphicsDiagLog("WIN_FLUSH_END",
+                          "n=%llu copied=%d restored=%d cb=%p",
+                          static_cast<unsigned long long>(ordinal),
+                          copied, restored, mAttachedColorBuffer.Ptr());
+    }
     return copied && restored;
 }
 

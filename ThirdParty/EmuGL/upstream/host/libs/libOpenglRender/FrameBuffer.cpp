@@ -540,6 +540,11 @@ HandleType FrameBuffer::createColorBuffer(int p_width, int p_height,
         ret = genHandle();
         m_colorbuffers[ret].cb = cb;
         m_colorbuffers[ret].refcount = 1;
+        if (aeGraphicsDiagTraceEnabled()) {
+            aeGraphicsDiagLog("FB_CREATE_CB",
+                              "handle=%#x cb=%p size=%dx%d format=%#x",
+                              ret, cb.Ptr(), p_width, p_height, p_internalFormat);
+        }
     }
     return ret;
 }
@@ -596,6 +601,11 @@ HandleType FrameBuffer::createWindowSurface(int p_config, int p_width, int p_hei
         m_windows[ret] = win;
         RenderThreadInfo *tinfo = RenderThreadInfo::get();
         tinfo->m_windowSet.insert(ret);
+        if (aeGraphicsDiagTraceEnabled()) {
+            aeGraphicsDiagLog("FB_CREATE_WINDOW",
+                              "handle=%#x win=%p size=%dx%d config=%d",
+                              ret, win.Ptr(), p_width, p_height, p_config);
+        }
     }
 
     return ret;
@@ -688,7 +698,19 @@ bool FrameBuffer::flushWindowSurfaceColorBuffer(HandleType p_surface)
     }
 
     WindowSurface* surface = (*w).second.Ptr();
-    return surface->flushColorBuffer();
+    static uint64_t flushOrdinal = 0;
+    const uint64_t ordinal = ++flushOrdinal;
+    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
+    if (sample) aeGraphicsDiagLog("FB_FLUSH_WINDOW",
+                                  "n=%llu surface=%#x win=%p",
+                                  static_cast<unsigned long long>(ordinal),
+                                  p_surface, surface);
+    const bool ok = surface->flushColorBuffer();
+    if (sample) aeGraphicsDiagLog("FB_FLUSH_RESULT",
+                                  "n=%llu surface=%#x ok=%d",
+                                  static_cast<unsigned long long>(ordinal),
+                                  p_surface, ok);
+    return ok;
 }
 
 bool FrameBuffer::setWindowSurfaceColorBuffer(HandleType p_surface,
@@ -710,6 +732,12 @@ bool FrameBuffer::setWindowSurfaceColorBuffer(HandleType p_surface,
         return false;
     }
 
+    if (aeGraphicsDiagTraceEnabled()) {
+        aeGraphicsDiagLog("FB_SET_WINDOW_CB",
+                          "surface=%#x win=%p colorbuffer=%#x cb=%p",
+                          p_surface, (*w).second.Ptr(),
+                          p_colorbuffer, (*c).second.cb.Ptr());
+    }
     (*w).second->setColorBuffer((*c).second.cb);
     return true;
 }
@@ -741,6 +769,17 @@ bool FrameBuffer::updateColorBuffer(HandleType p_colorbuffer,
         return false;
     }
 
+    if (aeGraphicsDiagTraceEnabled()) {
+        static std::atomic<uint64_t> updateOrdinal(0);
+        const uint64_t ordinal = updateOrdinal.fetch_add(1) + 1;
+        if (aeGraphicsDiagSample(ordinal)) {
+            aeGraphicsDiagLog("FB_UPDATE_CB",
+                              "n=%llu handle=%#x cb=%p region=(%d,%d %dx%d) format=%#x type=%#x",
+                              static_cast<unsigned long long>(ordinal),
+                              p_colorbuffer, (*c).second.cb.Ptr(),
+                              x, y, width, height, format, type);
+        }
+    }
     (*c).second.cb->subUpdate(x, y, width, height, format, type, pixels);
 
     return true;
@@ -756,6 +795,16 @@ bool FrameBuffer::bindColorBufferToTexture(HandleType p_colorbuffer)
         return false;
     }
 
+    if (aeGraphicsDiagTraceEnabled()) {
+        static std::atomic<uint64_t> bindOrdinal(0);
+        const uint64_t ordinal = bindOrdinal.fetch_add(1) + 1;
+        if (aeGraphicsDiagSample(ordinal)) {
+            aeGraphicsDiagLog("FB_BIND_TEXTURE",
+                              "n=%llu handle=%#x cb=%p",
+                              static_cast<unsigned long long>(ordinal),
+                              p_colorbuffer, (*c).second.cb.Ptr());
+        }
+    }
     return (*c).second.cb->bindToTexture();
 }
 
@@ -923,6 +972,9 @@ bool FrameBuffer::unbind_locked()
 
 bool FrameBuffer::post(HandleType p_colorbuffer, bool needLock)
 {
+    static uint64_t postOrdinal = 0;
+    const uint64_t ordinal = ++postOrdinal;
+    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
     if (needLock) {
         m_lock.lock();
     }
@@ -934,15 +986,31 @@ bool FrameBuffer::post(HandleType p_colorbuffer, bool needLock)
     }
 
     m_lastPostedColorBuffer = p_colorbuffer;
+    if (sample) {
+        aeGraphicsDiagLog("FB_POST_BEGIN",
+                          "n=%llu handle=%#x cb=%p size=%dx%d headless=%d",
+                          static_cast<unsigned long long>(ordinal),
+                          p_colorbuffer, (*c).second.cb.Ptr(),
+                          m_width, m_height, !m_subWin);
+    }
     if (!m_subWin) {
         // AndroidEmu is headless: post to the iOS display without a desktop window.
         if (m_onPost && (*c).second.cb->getWidth() == (GLuint)m_width &&
             (*c).second.cb->getHeight() == (GLuint)m_height &&
             (*c).second.cb->readback(m_fbImage)) {
+            if (sample) {
+                aeGraphicsDiagPixels("FB_POST_RGBA", m_fbImage,
+                                     m_width, m_height,
+                                     static_cast<size_t>(m_width) * 4, false);
+            }
             m_onPost(m_onPostContext, m_width, m_height, -1,
                      GL_RGBA, GL_UNSIGNED_BYTE, m_fbImage);
             ret = true;
         }
+        if (sample) aeGraphicsDiagLog("FB_POST_END",
+                                     "n=%llu handle=%#x ok=%d",
+                                     static_cast<unsigned long long>(ordinal),
+                                     p_colorbuffer, ret);
         goto EXIT;
     }
 

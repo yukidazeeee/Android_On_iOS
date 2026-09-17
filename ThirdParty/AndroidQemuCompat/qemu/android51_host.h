@@ -31,6 +31,19 @@ void android51_host_stop(void);
 /* Cached TCG metrics: 0=used bytes, 1=capacity bytes, 2=TB flush count. */
 uint64_t android51_host_metric(unsigned index);
 bool android51_tcg_set_region(void *rw, void *rx, size_t bytes);
+
+/* Deep graphics pipeline diagnostics exposed by the embedded framework. */
+size_t android51_host_graphics_diagnostics(char *out, size_t capacity);
+void android51_host_clear_graphics_diagnostics(void);
+void android51_host_graphics_mark(const char *label);
+void android51_host_graphics_note_frame(const uint8_t *pixels,
+                                        size_t stride,
+                                        uint32_t frame_width,
+                                        uint32_t frame_height,
+                                        uint32_t x,
+                                        uint32_t y,
+                                        uint32_t width,
+                                        uint32_t height);
 /* Internal device hooks; callbacks remain installed until CPUs are stopped. */
 void android51_host_frame(const uint8_t *, size_t, uint32_t, uint32_t, uint32_t, uint32_t);
 void android51_host_pcm(const uint8_t *, size_t);

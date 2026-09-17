@@ -109,6 +109,9 @@ struct RuntimeView: View {
                             NavigationLink("APK・ADB") { ADBToolsView(client: adb, paused: runtime.paused, resume: { runtime.pause(false) }) }
                         }
                         NavigationLink("シリアルログ") { RuntimeLogView(text: runtime.controller.serialText) }
+                        NavigationLink("描画パイプラインログ") {
+                            RuntimeGraphicsDiagnosticsView(controller: runtime.controller)
+                        }
                     }
                     Section {
                         Text(runtime.status)
@@ -190,6 +193,44 @@ private struct GuestKey: View {
             }
         }
         .disabled(runtime.stopped)
+    }
+}
+
+private struct RuntimeGraphicsDiagnosticsView: View {
+    let controller: AEVMController
+    @State private var text = ""
+
+    var body: some View {
+        ScrollView {
+            Text(text)
+                .font(.caption2.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+        }
+        .navigationTitle("描画パイプライン")
+        .toolbar {
+            Button("ノイズ地点をマーク") {
+                controller.markGraphicsDiagnostics()
+                refresh()
+            }
+            Button("消去") {
+                controller.clearGraphicsDiagnostics()
+                refresh()
+            }
+            ShareLink(item: text)
+        }
+        .task {
+            refresh()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                refresh()
+            }
+        }
+    }
+
+    private func refresh() {
+        text = controller.graphicsDiagnosticsText
     }
 }
 

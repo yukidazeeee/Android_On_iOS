@@ -50,6 +50,13 @@ static void applyGraphicsDiagnosticEnvironment() {
     setGraphicsDiagnostic(defaults, @"graphics.diag.dropEGLImageOnOrphan", "AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN");
     setGraphicsDiagnostic(defaults, @"graphics.diag.forceFullHostFrame", "AE_DIAG_FORCE_FULL_HOST_FRAME");
     setGraphicsDiagnostic(defaults, @"graphics.diag.visualizeAlpha", "AE_DIAG_VISUALIZE_ALPHA");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.tracePipeline", "AE_DIAG_TRACE_PIPELINE");
+    setGraphicsDiagnostic(defaults, @"graphics.diag.pixelFingerprints", "AE_DIAG_PIXEL_FINGERPRINTS");
+    NSInteger traceEvery = [defaults integerForKey:@"graphics.diag.traceEvery"];
+    if (traceEvery < 1 || traceEvery > 600) traceEvery = 30;
+    char traceEveryText[16];
+    snprintf(traceEveryText, sizeof(traceEveryText), "%ld", (long)traceEvery);
+    setenv("AE_DIAG_TRACE_EVERY", traceEveryText, 1);
     fprintf(stderr,
             "AEGFXDIAG cpu=%d noFinish=%d discard=%d preserved=%d clearAttach=%d "
             "noImagePreserve=%d nearest=%d dropOrphan=%d fullHost=%d alpha=%d\n",
@@ -63,6 +70,10 @@ static void applyGraphicsDiagnosticEnvironment() {
             getenv("AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN") != nullptr,
             getenv("AE_DIAG_FORCE_FULL_HOST_FRAME") != nullptr,
             getenv("AE_DIAG_VISUALIZE_ALPHA") != nullptr);
+    fprintf(stderr, "AEGFXDIAG deep trace=%d pixels=%d every=%s\n",
+            getenv("AE_DIAG_TRACE_PIPELINE") != nullptr,
+            getenv("AE_DIAG_PIXEL_FINGERPRINTS") != nullptr,
+            traceEveryText);
 }
 @implementation AEVMController {
     AEMetalDisplay *_display;
@@ -81,6 +92,11 @@ static void applyGraphicsDiagnosticEnvironment() {
     void (*_stop)(void);
     uint64_t (*_metric)(unsigned);
     bool (*_region)(void *, void *, size_t);
+    size_t (*_graphicsDiagnostics)(char *, size_t);
+    void (*_graphicsClear)(void);
+    void (*_graphicsMark)(const char *);
+    void (*_graphicsNoteFrame)(const uint8_t *, size_t, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t, uint32_t);
     BOOL _started, _stopped, _guestPaused;
     uint32_t _width, _height;
     UIBackgroundTaskIdentifier _saveTask;
@@ -110,6 +126,18 @@ static void applyGraphicsDiagnosticEnvironment() {
     auto text = emu::logUTF8(static_cast<const uint8_t *>(copy.bytes), copy.length);
     return [[NSString alloc] initWithBytes:text.data() length:text.size() encoding:NSUTF8StringEncoding] ?: @"";
 }
+- (NSString *)graphicsDiagnosticsText {
+    if (!_graphicsDiagnostics) return @"描画診断ログはまだ利用できません。";
+    std::vector<char> buffer(512 * 1024 + 1);
+    size_t bytes = _graphicsDiagnostics(buffer.data(), buffer.size());
+    if (!bytes) return @"描画診断ログは空です。設定で詳細パイプライントレースを有効にして、Androidを起動し直してください。";
+    bytes = MIN(bytes, buffer.size() - 1);
+    return [[NSString alloc] initWithBytes:buffer.data()
+                                   length:bytes
+                                 encoding:NSUTF8StringEncoding] ?: @"描画診断ログのUTF-8変換に失敗しました。";
+}
+- (void)clearGraphicsDiagnostics { if (_graphicsClear) _graphicsClear(); }
+- (void)markGraphicsDiagnostics { if (_graphicsMark) _graphicsMark("USER_SAW_NOISE"); }
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
@@ -226,6 +254,14 @@ static void applyGraphicsDiagnosticEnvironment() {
     _stop = reinterpret_cast<decltype(_stop)>(resolve("android51_host_stop"));
     _metric = reinterpret_cast<decltype(_metric)>(resolve("android51_host_metric"));
     _region = reinterpret_cast<decltype(_region)>(resolve("android51_tcg_set_region"));
+    _graphicsDiagnostics = reinterpret_cast<decltype(_graphicsDiagnostics)>(
+            resolve("android51_host_graphics_diagnostics"));
+    _graphicsClear = reinterpret_cast<decltype(_graphicsClear)>(
+            resolve("android51_host_clear_graphics_diagnostics"));
+    _graphicsMark = reinterpret_cast<decltype(_graphicsMark)>(
+            resolve("android51_host_graphics_mark"));
+    _graphicsNoteFrame = reinterpret_cast<decltype(_graphicsNoteFrame)>(
+            resolve("android51_host_graphics_note_frame"));
     for (const char *name : {"android51_adb_connected", "android51_adb_disconnect",
                             "android51_adb_read", "android51_adb_write"}) {
         resolve(name);
@@ -318,6 +354,9 @@ static void applyGraphicsDiagnosticEnvironment() {
 - (void)background:(NSNotification *)note { (void)note; [self setGuestPaused:YES]; }
 - (void)memoryWarning:(NSNotification *)note { (void)note; [self setGuestPaused:YES]; _statusText = @"メモリ不足のため一時停止しました"; }
 - (void)hostFrame:(const uint8_t *)p stride:(size_t)s x:(uint32_t)x y:(uint32_t)y width:(uint32_t)w height:(uint32_t)h {
+    if (_graphicsNoteFrame) {
+        _graphicsNoteFrame(p, s, _width, _height, x, y, w, h);
+    }
     if ([_display submitPixels:p length:s * _height stride:s x:x y:y width:w height:h]) [_metrics receivedFrameBytes:(uint64_t)w * h * 4];
 }
 - (size_t)hostInput:(Android51Event *)events capacity:(size_t)capacity {

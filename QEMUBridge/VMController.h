@@ -7,6 +7,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly, nullable) AEADBClient *adb;
 @property(nonatomic, readonly) NSString *statusText;
 @property(nonatomic, readonly) NSString *serialText;
+@property(nonatomic, readonly) NSString *graphicsDiagnosticsText;
 @property(nonatomic, readonly) BOOL engineAvailable;
 @property(nonatomic, readonly) BOOL started;
 @property(nonatomic, readonly) BOOL stopped;
@@ -15,6 +16,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)setGuestPaused:(BOOL)paused;
 - (void)stopGuest;
 - (void)sendGuestKey:(uint16_t)code pressed:(BOOL)pressed NS_SWIFT_NAME(sendGuestKey(_:pressed:));
+- (void)clearGraphicsDiagnostics;
+- (void)markGraphicsDiagnostics;
 - (NSDictionary<NSString *, NSNumber *> *)statistics;
 @end
 NS_ASSUME_NONNULL_END

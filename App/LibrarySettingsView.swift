@@ -16,6 +16,9 @@ struct LibrarySettingsView: View {
     @AppStorage("graphics.diag.dropEGLImageOnOrphan") private var diagDropEGLImageOnOrphan = false
     @AppStorage("graphics.diag.forceFullHostFrame") private var diagForceFullHostFrame = false
     @AppStorage("graphics.diag.visualizeAlpha") private var diagVisualizeAlpha = false
+    @AppStorage("graphics.diag.tracePipeline") private var diagTracePipeline = false
+    @AppStorage("graphics.diag.pixelFingerprints") private var diagPixelFingerprints = false
+    @AppStorage("graphics.diag.traceEvery") private var diagTraceEvery = 30
     var body: some View {
         List {
             Section("VM Settings") {
@@ -53,6 +56,17 @@ struct LibrarySettingsView: View {
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section {
+                Toggle("詳細パイプライントレース", isOn: $diagTracePipeline)
+                Toggle("画素ハッシュ・α統計を採取（重い）", isOn: $diagPixelFingerprints)
+                Picker("ログ採取間隔", selection: $diagTraceEvery) {
+                    Text("毎フレーム").tag(1)
+                    Text("5フレームごと").tag(5)
+                    Text("30フレームごと").tag(30)
+                    Text("120フレームごと").tag(120)
+                }
+                .disabled(!diagTracePipeline && !diagPixelFingerprints)
+                Text("画素ハッシュONではreverse EGLImageの前後、forward EGLImageのsource/import直後、最終post、QEMU→iOS callbackのRGBA/RGB/αハッシュと4×4領域fingerprintを記録します。短時間だけ「毎フレーム」にすると最も詳しく追跡できます。")
+                    .font(.footnote).foregroundStyle(.secondary)
                 Toggle("reverse EGLImageをCPUコピーに置換", isOn: $diagCPUReverseBlit)
                 Toggle("共有EGLImageのglFinish同期を無効化", isOn: $diagDisableSharedImageFinish)
                 Toggle("GL_EXT_discard_framebufferを広告", isOn: $diagAdvertiseDiscard)
@@ -78,6 +92,9 @@ struct LibrarySettingsView: View {
                     diagDropEGLImageOnOrphan = false
                     diagForceFullHostFrame = false
                     diagVisualizeAlpha = false
+                    diagTracePipeline = false
+                    diagPixelFingerprints = false
+                    diagTraceEvery = 30
                 }
             } header: {
                 Text("描画診断")

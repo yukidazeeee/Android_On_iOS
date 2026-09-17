@@ -21,6 +21,30 @@ static bool paused;
 static uint64_t metrics[3];
 static unsigned polls;
 uint64_t android51_host_metric(unsigned index) { return index < 3 ? qatomic_read(&metrics[index]) : 0; }
+size_t android51_host_graphics_diagnostics(char *out, size_t capacity)
+{
+    return ae_gpu_diagnostics_copy(out, capacity);
+}
+void android51_host_clear_graphics_diagnostics(void)
+{
+    ae_gpu_diagnostics_clear();
+}
+void android51_host_graphics_mark(const char *label)
+{
+    ae_gpu_diagnostics_mark(label);
+}
+void android51_host_graphics_note_frame(const uint8_t *pixels,
+                                        size_t stride,
+                                        uint32_t frame_width,
+                                        uint32_t frame_height,
+                                        uint32_t x,
+                                        uint32_t y,
+                                        uint32_t w,
+                                        uint32_t h)
+{
+    ae_gpu_diagnostics_note_bgra_frame(
+            pixels, stride, frame_width, frame_height, x, y, w, h);
+}
 static QEMUTimer *poll_timer;
 static Android51Event pending[128];
 static size_t pending_index, pending_count;

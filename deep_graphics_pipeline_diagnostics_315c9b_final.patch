@@ -1,0 +1,1133 @@
+# Android_On_iOS deep graphics pipeline diagnostics
+# Base: 315c9b141c547bb5483f4a7a59304f6b4c0b5a5a
+# Runtime switches live under Settings > 詳細設定 > 描画診断.
+#
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/GraphicsDiagnostics.h b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/GraphicsDiagnostics.h
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/GraphicsDiagnostics.h
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/GraphicsDiagnostics.h
+@@ -1,10 +1,38 @@
+ #ifndef ANDROIDEMU_GRAPHICS_DIAGNOSTICS_H
+ #define ANDROIDEMU_GRAPHICS_DIAGNOSTICS_H
+ 
++#include <stddef.h>
++#include <stdint.h>
+ #include <stdlib.h>
++
+ inline bool aeGraphicsDiagEnabled(const char *name) {
+     const char *value = getenv(name);
+     return value && value[0] == '1' && value[1] == '\0';
+ }
+ 
++// Deep renderer tracing is intentionally runtime-controlled. Event tracing is
++// lightweight; pixel fingerprints perform synchronous readbacks and can change
++// timing, so they are a separate switch.
++bool aeGraphicsDiagTraceEnabled();
++bool aeGraphicsDiagPixelFingerprints();
++unsigned aeGraphicsDiagTraceEvery();
++bool aeGraphicsDiagSample(uint64_t ordinal);
++void aeGraphicsDiagLog(const char *stage, const char *format, ...);
++void aeGraphicsDiagPixels(const char *stage,
++                          const unsigned char *pixels,
++                          unsigned width,
++                          unsigned height,
++                          size_t stride,
++                          bool bgra);
++void aeGraphicsDiagComparePixels(const char *stage,
++                                 const unsigned char *first,
++                                 size_t firstStride,
++                                 bool firstBgra,
++                                 const unsigned char *second,
++                                 size_t secondStride,
++                                 bool secondBgra,
++                                 unsigned width,
++                                 unsigned height,
++                                 bool flipSecondY);
++
+ #endif
+diff --git a/ThirdParty/EmuGL/Bridge.h b/ThirdParty/EmuGL/Bridge.h
+--- a/ThirdParty/EmuGL/Bridge.h
++++ b/ThirdParty/EmuGL/Bridge.h
+@@ -20,7 +20,33 @@
+ /* Update a persistent BGRA backing store; untouched rows retain their pixels. */
+ int ae_gpu_frame_region(uint8_t *bgra, size_t size, unsigned *first, unsigned *rows);
+ int ae_gpu_frame(uint8_t *bgra, size_t size); /* latest frame, top-left origin */
++
++/* Deep graphics diagnostics. The log is a bounded in-memory ring owned by
++ * EmuGL, so the iOS app can retrieve it without depending on stderr capture. */
++size_t ae_gpu_diagnostics_copy(char *out, size_t capacity);
++void ae_gpu_diagnostics_clear(void);
++void ae_gpu_diagnostics_mark(const char *label);
++void ae_gpu_diagnostics_note_bgra_frame(const uint8_t *pixels,
++                                        size_t stride,
++                                        unsigned frame_width,
++                                        unsigned frame_height,
++                                        unsigned x,
++                                        unsigned y,
++                                        unsigned width,
++                                        unsigned height);
+ #ifdef __cplusplus
+ }
++// Internal C++ tracing helpers. These stay outside the C ABI block.
++bool aeGraphicsDiagTraceEnabled();
++bool aeGraphicsDiagPixelFingerprints();
++unsigned aeGraphicsDiagTraceEvery();
++bool aeGraphicsDiagSample(uint64_t ordinal);
++void aeGraphicsDiagLog(const char *stage, const char *format, ...);
++void aeGraphicsDiagPixels(const char *stage,
++                          const unsigned char *pixels,
++                          unsigned width,
++                          unsigned height,
++                          size_t stride,
++                          bool bgra);
+ #endif
+ #endif
+diff --git a/ThirdParty/EmuGL/Bridge.cpp b/ThirdParty/EmuGL/Bridge.cpp
+--- a/ThirdParty/EmuGL/Bridge.cpp
++++ b/ThirdParty/EmuGL/Bridge.cpp
+@@ -13,3 +13,7 @@
+ #include <new>
+ #include <cstdio>
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdarg>
++#include <string>
+@@ -20,3 +24,40 @@
+ unsigned width, height, dirtyFirst, dirtyLast;
+ std::vector<uint8_t> rgba;
++
++std::mutex diagnosticsLock;
++std::string diagnosticsText;
++std::atomic<uint64_t> diagnosticsSequence(0);
++const std::chrono::steady_clock::time_point diagnosticsStarted =
++        std::chrono::steady_clock::now();
++const size_t kDiagnosticsLimit = 512 * 1024;
++
++void appendDiagnosticsLine(const char *stage, const char *body) {
++    if (!aeGraphicsDiagTraceEnabled()) return;
++    const uint64_t sequence = diagnosticsSequence.fetch_add(1) + 1;
++    const uint64_t ms = static_cast<uint64_t>(
++            std::chrono::duration_cast<std::chrono::milliseconds>(
++                    std::chrono::steady_clock::now() - diagnosticsStarted).count());
++    char line[1024];
++    const int written = std::snprintf(
++            line, sizeof(line), "#%06llu +%llums %-22s %s\n",
++            static_cast<unsigned long long>(sequence),
++            static_cast<unsigned long long>(ms),
++            stage ? stage : "?", body ? body : "");
++    if (written <= 0) return;
++    const size_t bytes = std::min<size_t>(
++            static_cast<size_t>(written), sizeof(line) - 1);
++    std::lock_guard<std::mutex> lock(diagnosticsLock);
++    diagnosticsText.append(line, bytes);
++    if (diagnosticsText.size() > kDiagnosticsLimit) {
++        size_t drop = diagnosticsText.size() - kDiagnosticsLimit;
++        size_t newline = diagnosticsText.find('\n', drop);
++        diagnosticsText.erase(0, newline == std::string::npos ? drop : newline + 1);
++    }
++}
++
++inline void hashByte(uint64_t *hash, uint8_t value) {
++    *hash ^= value;
++    *hash *= 1099511628211ULL;
++}
++
+ void post(void *, int w, int h, int direction, int format, int type, unsigned char *pixels) {
+@@ -28,4 +69,15 @@
+     const bool visualizeAlpha = aeGraphicsDiagEnabled("AE_DIAG_VISUALIZE_ALPHA");
+     const bool forceFullFrame =
+             visualizeAlpha || aeGraphicsDiagEnabled("AE_DIAG_FORCE_FULL_HOST_FRAME");
++    static std::atomic<uint64_t> postOrdinal(0);
++    const uint64_t ordinal = postOrdinal.fetch_add(1) + 1;
++    const bool traceSample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
++    if (traceSample) {
++        aeGraphicsDiagLog("BRIDGE_POST",
++                          "frame=%llu size=%dx%d visualizeAlpha=%d forceFull=%d",
++                          static_cast<unsigned long long>(ordinal), w, h,
++                          visualizeAlpha, forceFullFrame);
++        aeGraphicsDiagPixels("BRIDGE_INPUT_RGBA", pixels, width, height,
++                             static_cast<size_t>(width) * 4, false);
++    }
+     std::lock_guard<std::mutex> lock(frameLock);
+@@ -50,5 +102,9 @@
+     if (forceFullFrame) {
+         pending = true; dirtyFirst = 0; dirtyLast = height - 1;
+     }
++    if (traceSample) {
++        aeGraphicsDiagPixels("BRIDGE_OUTPUT_BGRA", frame.data(), width, height,
++                             static_cast<size_t>(width) * 4, true);
++    }
+     havePost = true;
+ }
+@@ -105,2 +161,194 @@
+ }
++
++bool aeGraphicsDiagTraceEnabled() {
++    return aeGraphicsDiagEnabled("AE_DIAG_TRACE_PIPELINE") ||
++           aeGraphicsDiagEnabled("AE_DIAG_PIXEL_FINGERPRINTS");
++}
++
++bool aeGraphicsDiagPixelFingerprints() {
++    return aeGraphicsDiagEnabled("AE_DIAG_PIXEL_FINGERPRINTS");
++}
++
++unsigned aeGraphicsDiagTraceEvery() {
++    const char *value = getenv("AE_DIAG_TRACE_EVERY");
++    if (!value || !*value) return 30;
++    char *end = nullptr;
++    unsigned long parsed = strtoul(value, &end, 10);
++    if (!end || *end || parsed < 1) return 30;
++    return static_cast<unsigned>(std::min<unsigned long>(parsed, 600));
++}
++
++bool aeGraphicsDiagSample(uint64_t ordinal) {
++    const unsigned every = aeGraphicsDiagTraceEvery();
++    return ordinal == 1 || every == 1 || (ordinal % every) == 0;
++}
++
++void aeGraphicsDiagLog(const char *stage, const char *format, ...) {
++    if (!aeGraphicsDiagTraceEnabled()) return;
++    char body[768];
++    va_list args;
++    va_start(args, format);
++    std::vsnprintf(body, sizeof(body), format ? format : "", args);
++    va_end(args);
++    appendDiagnosticsLine(stage, body);
++}
++
++void aeGraphicsDiagPixels(const char *stage,
++                          const unsigned char *pixels,
++                          unsigned w,
++                          unsigned h,
++                          size_t stride,
++                          bool bgra) {
++    if (!aeGraphicsDiagPixelFingerprints() || !pixels || !w || !h ||
++        stride < static_cast<size_t>(w) * 4) return;
++
++    uint64_t rgbaHash = 1469598103934665603ULL;
++    uint64_t rgbHash = 1469598103934665603ULL;
++    uint64_t alphaHash = 1469598103934665603ULL;
++    uint64_t tileHashes[16];
++    for (uint64_t &tile : tileHashes) tile = 1469598103934665603ULL;
++    uint64_t alphaZero = 0, alphaPartial = 0, alphaFull = 0;
++    unsigned alphaMin = 255, alphaMax = 0;
++
++    for (unsigned y = 0; y < h; ++y) {
++        const unsigned char *row = pixels + static_cast<size_t>(y) * stride;
++        for (unsigned x = 0; x < w; ++x) {
++            const unsigned char *p = row + static_cast<size_t>(x) * 4;
++            const uint8_t r = bgra ? p[2] : p[0];
++            const uint8_t g = p[1];
++            const uint8_t b = bgra ? p[0] : p[2];
++            const uint8_t a = p[3];
++            hashByte(&rgbaHash, r); hashByte(&rgbaHash, g);
++            hashByte(&rgbaHash, b); hashByte(&rgbaHash, a);
++            hashByte(&rgbHash, r); hashByte(&rgbHash, g); hashByte(&rgbHash, b);
++            hashByte(&alphaHash, a);
++            const unsigned tx = std::min(3u, static_cast<unsigned>(
++                    (static_cast<uint64_t>(x) * 4) / w));
++            const unsigned ty = std::min(3u, static_cast<unsigned>(
++                    (static_cast<uint64_t>(y) * 4) / h));
++            uint64_t *tile = &tileHashes[ty * 4 + tx];
++            hashByte(tile, r); hashByte(tile, g); hashByte(tile, b); hashByte(tile, a);
++            alphaMin = std::min(alphaMin, static_cast<unsigned>(a));
++            alphaMax = std::max(alphaMax, static_cast<unsigned>(a));
++            if (a == 0) ++alphaZero;
++            else if (a == 255) ++alphaFull;
++            else ++alphaPartial;
++        }
++    }
++
++    char tiles[16 * 5 + 1];
++    size_t offset = 0;
++    for (unsigned i = 0; i < 16; ++i) {
++        const int n = std::snprintf(tiles + offset, sizeof(tiles) - offset,
++                                    "%04x%s",
++                                    static_cast<unsigned>(tileHashes[i] & 0xffff),
++                                    i == 15 ? "" : ".");
++        if (n <= 0) break;
++        offset += std::min<size_t>(static_cast<size_t>(n),
++                                   sizeof(tiles) - offset - 1);
++    }
++    tiles[sizeof(tiles) - 1] = '\0';
++
++    aeGraphicsDiagLog(
++            stage,
++            "size=%ux%u hashRGBA=%016llx hashRGB=%016llx hashA=%016llx "
++            "alpha[min=%u max=%u zero=%llu partial=%llu full=%llu] tiles4x4=%s",
++            w, h,
++            static_cast<unsigned long long>(rgbaHash),
++            static_cast<unsigned long long>(rgbHash),
++            static_cast<unsigned long long>(alphaHash),
++            alphaMin, alphaMax,
++            static_cast<unsigned long long>(alphaZero),
++            static_cast<unsigned long long>(alphaPartial),
++            static_cast<unsigned long long>(alphaFull),
++            tiles);
++}
++
++void aeGraphicsDiagComparePixels(const char *stage,
++                                 const unsigned char *first,
++                                 size_t firstStride,
++                                 bool firstBgra,
++                                 const unsigned char *second,
++                                 size_t secondStride,
++                                 bool secondBgra,
++                                 unsigned w,
++                                 unsigned h,
++                                 bool flipSecondY) {
++    if (!aeGraphicsDiagPixelFingerprints() || !first || !second || !w || !h)
++        return;
++    uint64_t bad = 0;
++    unsigned minX = w, minY = h, maxX = 0, maxY = 0, maxDelta = 0;
++    for (unsigned y = 0; y < h; ++y) {
++        const unsigned char *aRow = first + static_cast<size_t>(y) * firstStride;
++        const unsigned by = flipSecondY ? h - 1 - y : y;
++        const unsigned char *bRow = second + static_cast<size_t>(by) * secondStride;
++        for (unsigned x = 0; x < w; ++x) {
++            const unsigned char *ap = aRow + static_cast<size_t>(x) * 4;
++            const unsigned char *bp = bRow + static_cast<size_t>(x) * 4;
++            const uint8_t av[4] = {
++                firstBgra ? ap[2] : ap[0], ap[1],
++                firstBgra ? ap[0] : ap[2], ap[3]
++            };
++            const uint8_t bv[4] = {
++                secondBgra ? bp[2] : bp[0], bp[1],
++                secondBgra ? bp[0] : bp[2], bp[3]
++            };
++            bool different = false;
++            for (unsigned c = 0; c < 4; ++c) {
++                const unsigned delta = av[c] > bv[c] ? av[c] - bv[c] : bv[c] - av[c];
++                maxDelta = std::max(maxDelta, delta);
++                different |= delta != 0;
++            }
++            if (different) {
++                ++bad;
++                minX = std::min(minX, x); minY = std::min(minY, y);
++                maxX = std::max(maxX, x); maxY = std::max(maxY, y);
++            }
++        }
++    }
++    if (!bad) {
++        aeGraphicsDiagLog(stage, "PASS pixels=%ux%u flipSecondY=%d", w, h, flipSecondY);
++    } else {
++        aeGraphicsDiagLog(stage,
++                          "FAIL bad=%llu/%llu box=(%u,%u)-(%u,%u) maxDelta=%u flipSecondY=%d",
++                          static_cast<unsigned long long>(bad),
++                          static_cast<unsigned long long>(
++                                  static_cast<uint64_t>(w) * h),
++                          minX, minY, maxX, maxY, maxDelta, flipSecondY);
++    }
++}
++
++extern "C" size_t ae_gpu_diagnostics_copy(char *out, size_t capacity) {
++    std::lock_guard<std::mutex> lock(diagnosticsLock);
++    if (!out || !capacity) return diagnosticsText.size();
++    const size_t bytes = std::min(diagnosticsText.size(), capacity - 1);
++    if (bytes) std::memcpy(out, diagnosticsText.data(), bytes);
++    out[bytes] = '\0';
++    return bytes;
++}
++
++extern "C" void ae_gpu_diagnostics_clear(void) {
++    std::lock_guard<std::mutex> lock(diagnosticsLock);
++    diagnosticsText.clear();
++}
++
++extern "C" void ae_gpu_diagnostics_mark(const char *label) {
++    aeGraphicsDiagLog("USER_MARK", "%s", label ? label : "mark");
++}
++
++extern "C" void ae_gpu_diagnostics_note_bgra_frame(
++        const uint8_t *pixels, size_t stride,
++        unsigned frameWidth, unsigned frameHeight,
++        unsigned x, unsigned y, unsigned w, unsigned h) {
++    static std::atomic<uint64_t> hostOrdinal(0);
++    const uint64_t ordinal = hostOrdinal.fetch_add(1) + 1;
++    if (!aeGraphicsDiagTraceEnabled() || !aeGraphicsDiagSample(ordinal)) return;
++    aeGraphicsDiagLog("IOS_CALLBACK",
++                      "frame=%llu region=(%u,%u %ux%u) full=%ux%u stride=%zu",
++                      static_cast<unsigned long long>(ordinal),
++                      x, y, w, h, frameWidth, frameHeight, stride);
++    aeGraphicsDiagPixels("IOS_CALLBACK_BGRA", pixels, frameWidth, frameHeight,
++                         stride, true);
++}
++
+ extern "C" const char *ae_gpu_last_error() { return initializationError; }
+@@ -124,3 +372,22 @@
+ extern "C" int ae_gpu_init(unsigned w, unsigned h) {
+     if (attempted) return initialized;
+     attempted = true;
++    if (aeGraphicsDiagTraceEnabled()) {
++        aeGraphicsDiagLog(
++                "GPU_INIT",
++                "size=%ux%u every=%u pixels=%d cpuReverse=%d noFinish=%d "
++                "discard=%d preserved=%d clearAttach=%d noImagePreserve=%d "
++                "nearest=%d dropOrphan=%d fullHost=%d visualizeAlpha=%d",
++                w, h, aeGraphicsDiagTraceEvery(),
++                aeGraphicsDiagPixelFingerprints(),
++                aeGraphicsDiagEnabled("AE_DIAG_CPU_REVERSE_BLIT"),
++                aeGraphicsDiagEnabled("AE_DIAG_DISABLE_SHARED_IMAGE_FINISH"),
++                aeGraphicsDiagEnabled("AE_DIAG_ADVERTISE_DISCARD"),
++                aeGraphicsDiagEnabled("AE_DIAG_ADVERTISE_PRESERVED"),
++                aeGraphicsDiagEnabled("AE_DIAG_CLEAR_PBUFFER_ON_ATTACH"),
++                aeGraphicsDiagEnabled("AE_DIAG_DISABLE_EGLIMAGE_PRESERVED"),
++                aeGraphicsDiagEnabled("AE_DIAG_NEAREST_COLORBUFFER_FILTER"),
++                aeGraphicsDiagEnabled("AE_DIAG_DROP_EGLIMAGE_ON_ORPHAN"),
++                aeGraphicsDiagEnabled("AE_DIAG_FORCE_FULL_HOST_FRAME"),
++                aeGraphicsDiagEnabled("AE_DIAG_VISUALIZE_ALPHA"));
++    }
+@@ -185,4 +452,14 @@
+     size_t offset = size_t(dirtyFirst) * width * 4;
+     memcpy(pixels + offset, frame.data() + offset, size_t(*rows) * width * 4);
++    static std::atomic<uint64_t> regionOrdinal(0);
++    const uint64_t ordinal = regionOrdinal.fetch_add(1) + 1;
++    if (aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal)) {
++        aeGraphicsDiagLog("QEMU_FRAME_REGION",
++                          "frame=%llu first=%u rows=%u full=%ux%u",
++                          static_cast<unsigned long long>(ordinal),
++                          *first, *rows, width, height);
++        aeGraphicsDiagPixels("QEMU_FRAME_BGRA", frame.data(), width, height,
++                             static_cast<size_t>(width) * 4, true);
++    }
+     pending = false; return 1;
+ }
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp
+@@ -24,3 +24,4 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <vector>
++#include <atomic>
+@@ -50,4 +51,34 @@
+     s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ }
+ 
++bool diagnosticReadTextureRGBA(GLuint texture,
++                               GLuint width,
++                               GLuint height,
++                               std::vector<unsigned char> *pixels,
++                               GLenum *statusOut = NULL) {
++    if (!pixels || !texture || !width || !height) return false;
++    GLint previousFbo = 0;
++    GLint previousPack = 4;
++    s_gles2.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFbo);
++    s_gles2.glGetIntegerv(GL_PACK_ALIGNMENT, &previousPack);
++    GLuint fbo = 0;
++    s_gles2.glGenFramebuffers(1, &fbo);
++    s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++    s_gles2.glFramebufferTexture2D(
++            GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0_OES, GL_TEXTURE_2D, texture, 0);
++    const GLenum status = s_gles2.glCheckFramebufferStatus(GL_FRAMEBUFFER);
++    if (statusOut) *statusOut = status;
++    bool ok = status == GL_FRAMEBUFFER_COMPLETE_OES;
++    if (ok) {
++        pixels->resize(static_cast<size_t>(width) * height * 4);
++        s_gles2.glPixelStorei(GL_PACK_ALIGNMENT, 1);
++        s_gles2.glReadPixels(0, 0, width, height,
++                             GL_RGBA, GL_UNSIGNED_BYTE, pixels->data());
++    }
++    s_gles2.glPixelStorei(GL_PACK_ALIGNMENT, previousPack);
++    s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, previousFbo);
++    s_gles2.glDeleteFramebuffers(1, &fbo);
++    return ok;
++}
++
+ // Helper class to use a ColorBuffer::Helper context.
+@@ -214,4 +245,13 @@
+ #endif
++    if (aeGraphicsDiagTraceEnabled()) {
++        aeGraphicsDiagLog(
++                "CB_CREATE",
++                "cb=%p size=%dx%d internal=%#x tex=%u blitTex=%u eglImage=%p blitImage=%p preserveAttr=%d",
++                cb, p_width, p_height, p_internalFormat,
++                cb->m_tex, cb->m_blitTex,
++                cb->m_eglImage, cb->m_blitEGLImage,
++                !aeGraphicsDiagEnabled("AE_DIAG_DISABLE_EGLIMAGE_PRESERVED"));
++    }
+     return cb;
+ }
+ 
+@@ -229,4 +269,7 @@
+ ColorBuffer::~ColorBuffer() {
++    if (aeGraphicsDiagTraceEnabled()) {
++        aeGraphicsDiagLog("CB_DESTROY", "cb=%p tex=%u blitTex=%u", this, m_tex, m_blitTex);
++    }
+     ScopedHelperContext context(m_helper);
+ 
+     if (m_blitEGLImage) {
+@@ -264,4 +307,18 @@
+                             GLenum p_format,
+                             GLenum p_type,
+                             void* pixels) {
++    static std::atomic<uint64_t> updateOrdinal(0);
++    const uint64_t ordinal = updateOrdinal.fetch_add(1) + 1;
++    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
++    if (sample) {
++        aeGraphicsDiagLog("CB_SUBUPDATE",
++                          "n=%llu cb=%p region=(%d,%d %dx%d) format=%#x type=%#x",
++                          static_cast<unsigned long long>(ordinal), this,
++                          x, y, width, height, p_format, p_type);
++        if (p_format == GL_RGBA && p_type == GL_UNSIGNED_BYTE && pixels) {
++            aeGraphicsDiagPixels("CB_SUBUPDATE_RGBA",
++                                 static_cast<const unsigned char *>(pixels),
++                                 width, height, static_cast<size_t>(width) * 4, false);
++        }
++    }
+     ScopedHelperContext context(m_helper);
+@@ -300,5 +357,16 @@
++    static std::atomic<uint64_t> reverseOrdinal(0);
++    const uint64_t ordinal = reverseOrdinal.fetch_add(1) + 1;
++    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
++    const bool probe = aeGraphicsDiagPixelFingerprints() && aeGraphicsDiagSample(ordinal);
+     bool useCpuReverseBlit = aeGraphicsDiagEnabled("AE_DIAG_CPU_REVERSE_BLIT");
+ #ifdef AE_FORCE_CPU_COLORBUFFER_BLIT
+     useCpuReverseBlit = true;
+ #endif
++    if (sample) {
++        aeGraphicsDiagLog("REVERSE_BEGIN",
++                          "n=%llu cb=%p size=%ux%u gl2=%d path=%s",
++                          static_cast<unsigned long long>(ordinal), this,
++                          m_width, m_height, tInfo->currContext->isGL2(),
++                          useCpuReverseBlit ? "cpu" : "eglimage");
++    }
+     if (useCpuReverseBlit) {
+@@ -340,4 +408,10 @@
+         s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, previousFbo);
+     }
+ 
++    if (probe) {
++        aeGraphicsDiagPixels("REV_CPU_GUEST_FBO", rgba.data(),
++                             m_width, m_height,
++                             static_cast<size_t>(m_width) * 4, false);
++    }
++
+     const GLenum uploadFormat =
+@@ -377,5 +451,27 @@
++    if (probe && uploadFormat == GL_RGBA) {
++        std::vector<unsigned char> actual;
++        GLenum status = 0;
++        aeGraphicsDiagPixels("REV_CPU_UPLOAD_RGBA", upload.data(),
++                             m_width, m_height,
++                             static_cast<size_t>(m_width) * 4, false);
++        if (diagnosticReadTextureRGBA(m_tex, m_width, m_height, &actual, &status)) {
++            aeGraphicsDiagPixels("REV_CPU_MTEX_RGBA", actual.data(),
++                                 m_width, m_height,
++                                 static_cast<size_t>(m_width) * 4, false);
++            aeGraphicsDiagComparePixels(
++                    "REV_CPU_UPLOAD_COMPARE",
++                    upload.data(), static_cast<size_t>(m_width) * 4, false,
++                    actual.data(), static_cast<size_t>(m_width) * 4, false,
++                    m_width, m_height, false);
++        } else {
++            aeGraphicsDiagLog("REV_CPU_MTEX_RGBA",
++                              "probe failed framebufferStatus=%#x", status);
++        }
++    }
+     s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, previousUnpack);
+     s_gles2.glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+     s_gles2.glActiveTexture(static_cast<GLenum>(previousActiveTexture));
++    if (sample) aeGraphicsDiagLog("REVERSE_END", "n=%llu cb=%p ok=1 path=cpu",
++                                  static_cast<unsigned long long>(ordinal), this);
+     return true;
+     } else {
+@@ -390,5 +486,6 @@
+     GLuint tmpTex = 0;
+     GLint currTexBind = 0;
+     GLint currFramebuffer = 0;
++    std::vector<unsigned char> guestProbe;
+ 
+     if (tInfo->currContext->isGL2()) {
+@@ -396,3 +493,15 @@
+         s_gles2.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &currFramebuffer);
+         s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        if (probe) {
++            GLint previousPack = 4;
++            s_gles2.glGetIntegerv(GL_PACK_ALIGNMENT, &previousPack);
++            s_gles2.glPixelStorei(GL_PACK_ALIGNMENT, 1);
++            guestProbe.resize(static_cast<size_t>(m_width) * m_height * 4);
++            s_gles2.glReadPixels(0, 0, m_width, m_height,
++                                 GL_RGBA, GL_UNSIGNED_BYTE, guestProbe.data());
++            s_gles2.glPixelStorei(GL_PACK_ALIGNMENT, previousPack);
++            aeGraphicsDiagPixels("REV_GUEST_FBO", guestProbe.data(),
++                                 m_width, m_height,
++                                 static_cast<size_t>(m_width) * 4, false);
++        }
+         s_gles2.glGetIntegerv(GL_TEXTURE_BINDING_2D, &currTexBind);
+@@ -416,3 +525,15 @@
+         s_gles1.glGetIntegerv(GL_FRAMEBUFFER_BINDING_OES, &currFramebuffer);
+         s_gles1.glBindFramebufferOES(GL_FRAMEBUFFER_OES, 0);
++        if (probe) {
++            GLint previousPack = 4;
++            s_gles1.glGetIntegerv(GL_PACK_ALIGNMENT, &previousPack);
++            s_gles1.glPixelStorei(GL_PACK_ALIGNMENT, 1);
++            guestProbe.resize(static_cast<size_t>(m_width) * m_height * 4);
++            s_gles1.glReadPixels(0, 0, m_width, m_height,
++                                 GL_RGBA, GL_UNSIGNED_BYTE, guestProbe.data());
++            s_gles1.glPixelStorei(GL_PACK_ALIGNMENT, previousPack);
++            aeGraphicsDiagPixels("REV_GUEST_FBO", guestProbe.data(),
++                                 m_width, m_height,
++                                 static_cast<size_t>(m_width) * 4, false);
++        }
+         s_gles1.glGetIntegerv(GL_TEXTURE_BINDING_2D, &currTexBind);
+@@ -440,6 +561,29 @@
+     ScopedHelperContext context(m_helper);
+     if (!context.isOk()) {
++        if (sample) aeGraphicsDiagLog("REVERSE_END", "n=%llu cb=%p ok=0 helperContext",
++                                      static_cast<unsigned long long>(ordinal), this);
+         return false;
+     }
+ 
++    std::vector<unsigned char> blitProbe;
++    if (probe) {
++        GLenum status = 0;
++        if (diagnosticReadTextureRGBA(
++                m_blitTex, m_width, m_height, &blitProbe, &status)) {
++            aeGraphicsDiagPixels("REV_BLIT_TEX", blitProbe.data(),
++                                 m_width, m_height,
++                                 static_cast<size_t>(m_width) * 4, false);
++            if (!guestProbe.empty()) {
++                aeGraphicsDiagComparePixels(
++                        "REV_GUEST_TO_BLIT",
++                        guestProbe.data(), static_cast<size_t>(m_width) * 4, false,
++                        blitProbe.data(), static_cast<size_t>(m_width) * 4, false,
++                        m_width, m_height, false);
++            }
++        } else {
++            aeGraphicsDiagLog("REV_BLIT_TEX",
++                              "probe failed framebufferStatus=%#x", status);
++        }
++    }
++
+     if (!bindFbo(&m_fbo, m_tex)) {
+@@ -468,6 +612,29 @@
+     }
+ #endif
+ 
++    if (probe && drawn) {
++        std::vector<unsigned char> outputProbe;
++        GLenum status = 0;
++        if (diagnosticReadTextureRGBA(
++                m_tex, m_width, m_height, &outputProbe, &status)) {
++            aeGraphicsDiagPixels("REV_MTEX", outputProbe.data(),
++                                 m_width, m_height,
++                                 static_cast<size_t>(m_width) * 4, false);
++            if (!blitProbe.empty()) {
++                aeGraphicsDiagComparePixels(
++                        "REV_BLIT_TO_MTEX_FLIP",
++                        blitProbe.data(), static_cast<size_t>(m_width) * 4, false,
++                        outputProbe.data(), static_cast<size_t>(m_width) * 4, false,
++                        m_width, m_height, true);
++            }
++        } else {
++            aeGraphicsDiagLog("REV_MTEX",
++                              "probe failed framebufferStatus=%#x", status);
++        }
++    }
++
+     s_gles2.glViewport(vport[0], vport[1], vport[2], vport[3]);
+     unbindFbo();
++    if (sample) aeGraphicsDiagLog("REVERSE_END", "n=%llu cb=%p ok=%d path=eglimage",
++                                  static_cast<unsigned long long>(ordinal), this, drawn);
+     return drawn;
+@@ -491,11 +658,75 @@
+     if (!tInfo->currContext.Ptr()) {
+         return false;
+     }
++
++    static std::atomic<uint64_t> forwardOrdinal(0);
++    const uint64_t ordinal = forwardOrdinal.fetch_add(1) + 1;
++    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
++    const bool probe = aeGraphicsDiagPixelFingerprints() && aeGraphicsDiagSample(ordinal);
++    std::vector<unsigned char> sourceProbe;
++
++    if (sample) {
++        GLint texture = 0;
++        if (tInfo->currContext->isGL2())
++            s_gles2.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++        else
++            s_gles1.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++        aeGraphicsDiagLog("FORWARD_BIND_BEGIN",
++                          "n=%llu cb=%p image=%p guestTex=%d gl2=%d size=%ux%u",
++                          static_cast<unsigned long long>(ordinal), this,
++                          m_eglImage, texture, tInfo->currContext->isGL2(),
++                          m_width, m_height);
++    }
++
++    if (probe) {
++        sourceProbe.resize(static_cast<size_t>(m_width) * m_height * 4);
++        if (readback(sourceProbe.data())) {
++            aeGraphicsDiagPixels("FWD_SOURCE_MTEX", sourceProbe.data(),
++                                 m_width, m_height,
++                                 static_cast<size_t>(m_width) * 4, false);
++        } else {
++            sourceProbe.clear();
++            aeGraphicsDiagLog("FWD_SOURCE_MTEX", "readback failed cb=%p", this);
++        }
++    }
++
+     if (tInfo->currContext->isGL2()) {
+         s_gles2.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_eglImage);
++        if (probe) {
++            GLint texture = 0;
++            s_gles2.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++            std::vector<unsigned char> importedProbe;
++            GLenum status = 0;
++            if (diagnosticReadTextureRGBA(
++                    static_cast<GLuint>(texture), m_width, m_height,
++                    &importedProbe, &status)) {
++                aeGraphicsDiagPixels("FWD_IMPORTED_TEX", importedProbe.data(),
++                                     m_width, m_height,
++                                     static_cast<size_t>(m_width) * 4, false);
++                if (!sourceProbe.empty()) {
++                    aeGraphicsDiagComparePixels(
++                            "FWD_SOURCE_TO_IMPORTED",
++                            sourceProbe.data(), static_cast<size_t>(m_width) * 4, false,
++                            importedProbe.data(), static_cast<size_t>(m_width) * 4, false,
++                            m_width, m_height, false);
++                }
++            } else {
++                aeGraphicsDiagLog("FWD_IMPORTED_TEX",
++                                  "probe failed guestTex=%d framebufferStatus=%#x",
++                                  texture, status);
++            }
++        }
+     }
+     else {
+         s_gles1.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_eglImage);
++        if (probe) {
++            aeGraphicsDiagLog("FWD_IMPORTED_TEX",
++                              "pixel probe skipped for GLES1 context cb=%p", this);
++        }
++    }
++    if (sample) {
++        aeGraphicsDiagLog("FORWARD_BIND_END",
++                          "n=%llu cb=%p", static_cast<unsigned long long>(ordinal), this);
+     }
+     return true;
+ }
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp
+@@ -535,5 +535,10 @@
+         m_colorbuffers[ret].cb = cb;
+         m_colorbuffers[ret].refcount = 1;
++        if (aeGraphicsDiagTraceEnabled()) {
++            aeGraphicsDiagLog("FB_CREATE_CB",
++                              "handle=%#x cb=%p size=%dx%d format=%#x",
++                              ret, cb.Ptr(), p_width, p_height, p_internalFormat);
++        }
+     }
+     return ret;
+ }
+@@ -587,6 +592,11 @@
+         m_windows[ret] = win;
+         RenderThreadInfo *tinfo = RenderThreadInfo::get();
+         tinfo->m_windowSet.insert(ret);
++        if (aeGraphicsDiagTraceEnabled()) {
++            aeGraphicsDiagLog("FB_CREATE_WINDOW",
++                              "handle=%#x win=%p size=%dx%d config=%d",
++                              ret, win.Ptr(), p_width, p_height, p_config);
++        }
+     }
+ 
+     return ret;
+@@ -669,3 +679,15 @@
+     WindowSurface* surface = (*w).second.Ptr();
+-    return surface->flushColorBuffer();
++    static uint64_t flushOrdinal = 0;
++    const uint64_t ordinal = ++flushOrdinal;
++    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
++    if (sample) aeGraphicsDiagLog("FB_FLUSH_WINDOW",
++                                  "n=%llu surface=%#x win=%p",
++                                  static_cast<unsigned long long>(ordinal),
++                                  p_surface, surface);
++    const bool ok = surface->flushColorBuffer();
++    if (sample) aeGraphicsDiagLog("FB_FLUSH_RESULT",
++                                  "n=%llu surface=%#x ok=%d",
++                                  static_cast<unsigned long long>(ordinal),
++                                  p_surface, ok);
++    return ok;
+ }
+@@ -701,3 +723,9 @@
++    if (aeGraphicsDiagTraceEnabled()) {
++        aeGraphicsDiagLog("FB_SET_WINDOW_CB",
++                          "surface=%#x win=%p colorbuffer=%#x cb=%p",
++                          p_surface, (*w).second.Ptr(),
++                          p_colorbuffer, (*c).second.cb.Ptr());
++    }
+     (*w).second->setColorBuffer((*c).second.cb);
+     return true;
+ }
+@@ -735,3 +763,14 @@
++    if (aeGraphicsDiagTraceEnabled()) {
++        static std::atomic<uint64_t> updateOrdinal(0);
++        const uint64_t ordinal = updateOrdinal.fetch_add(1) + 1;
++        if (aeGraphicsDiagSample(ordinal)) {
++            aeGraphicsDiagLog("FB_UPDATE_CB",
++                              "n=%llu handle=%#x cb=%p region=(%d,%d %dx%d) format=%#x type=%#x",
++                              static_cast<unsigned long long>(ordinal),
++                              p_colorbuffer, (*c).second.cb.Ptr(),
++                              x, y, width, height, format, type);
++        }
++    }
+     (*c).second.cb->subUpdate(x, y, width, height, format, type, pixels);
+ 
+     return true;
+@@ -757,5 +796,15 @@
+         return false;
+     }
+ 
++    if (aeGraphicsDiagTraceEnabled()) {
++        static std::atomic<uint64_t> bindOrdinal(0);
++        const uint64_t ordinal = bindOrdinal.fetch_add(1) + 1;
++        if (aeGraphicsDiagSample(ordinal)) {
++            aeGraphicsDiagLog("FB_BIND_TEXTURE",
++                              "n=%llu handle=%#x cb=%p",
++                              static_cast<unsigned long long>(ordinal),
++                              p_colorbuffer, (*c).second.cb.Ptr());
++        }
++    }
+     return (*c).second.cb->bindToTexture();
+ }
+@@ -920,5 +969,8 @@
+ bool FrameBuffer::post(HandleType p_colorbuffer, bool needLock)
+ {
++    static uint64_t postOrdinal = 0;
++    const uint64_t ordinal = ++postOrdinal;
++    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
+     if (needLock) {
+         m_lock.lock();
+     }
+@@ -934,12 +986,28 @@
+     m_lastPostedColorBuffer = p_colorbuffer;
++    if (sample) {
++        aeGraphicsDiagLog("FB_POST_BEGIN",
++                          "n=%llu handle=%#x cb=%p size=%dx%d headless=%d",
++                          static_cast<unsigned long long>(ordinal),
++                          p_colorbuffer, (*c).second.cb.Ptr(),
++                          m_width, m_height, !m_subWin);
++    }
+     if (!m_subWin) {
+         // AndroidEmu is headless: post to the iOS display without a desktop window.
+         if (m_onPost && (*c).second.cb->getWidth() == (GLuint)m_width &&
+             (*c).second.cb->getHeight() == (GLuint)m_height &&
+             (*c).second.cb->readback(m_fbImage)) {
++            if (sample) {
++                aeGraphicsDiagPixels("FB_POST_RGBA", m_fbImage,
++                                     m_width, m_height,
++                                     static_cast<size_t>(m_width) * 4, false);
++            }
+             m_onPost(m_onPostContext, m_width, m_height, -1,
+                      GL_RGBA, GL_UNSIGNED_BYTE, m_fbImage);
+             ret = true;
+         }
++        if (sample) aeGraphicsDiagLog("FB_POST_END",
++                                     "n=%llu handle=%#x ok=%d",
++                                     static_cast<unsigned long long>(ordinal),
++                                     p_colorbuffer, ret);
+         goto EXIT;
+     }
+diff --git a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp
+--- a/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp
++++ b/ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp
+@@ -26,5 +26,6 @@
+ #include <stdio.h>
+ #include <string.h>
++#include <atomic>
+ 
+ 
+ WindowSurface::WindowSurface(EGLDisplay display,
+@@ -58,4 +59,11 @@
+ void WindowSurface::setColorBuffer(ColorBufferPtr p_colorBuffer) {
++    ColorBuffer *previous = mAttachedColorBuffer.Ptr();
+     mAttachedColorBuffer = p_colorBuffer;
++    if (aeGraphicsDiagTraceEnabled()) {
++        aeGraphicsDiagLog("WIN_ATTACH_CB",
++                          "win=%p pbuffer=%p oldCb=%p newCb=%p size=%ux%u",
++                          this, mSurface, previous, mAttachedColorBuffer.Ptr(),
++                          mWidth, mHeight);
++    }
+ 
+     // resize the window if the attached color buffer is of different
+@@ -117,4 +125,18 @@
+ bool WindowSurface::flushColorBuffer() {
++    static std::atomic<uint64_t> flushOrdinal(0);
++    const uint64_t ordinal = flushOrdinal.fetch_add(1) + 1;
++    const bool sample = aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
++    if (sample) {
++        aeGraphicsDiagLog("WIN_FLUSH_BEGIN",
++                          "n=%llu win=%p pbuffer=%p cb=%p size=%ux%u drawCtx=%p currentCtx=%p",
++                          static_cast<unsigned long long>(ordinal), this, mSurface,
++                          mAttachedColorBuffer.Ptr(), mWidth, mHeight,
++                          mDrawContext.Ptr() ? mDrawContext->getEGLContext() : EGL_NO_CONTEXT,
++                          s_egl.eglGetCurrentContext());
++    }
+     if (!mAttachedColorBuffer.Ptr()) {
++        if (sample) aeGraphicsDiagLog("WIN_FLUSH_END",
++                                     "n=%llu noColorBuffer",
++                                     static_cast<unsigned long long>(ordinal));
+         return true;
+     }
+@@ -160,5 +182,11 @@
+ 
+     // restore current context/surface
+     bool restored = s_egl.eglMakeCurrent(mDisplay, prevDrawSurf, prevReadSurf, prevContext);
++    if (sample) {
++        aeGraphicsDiagLog("WIN_FLUSH_END",
++                          "n=%llu copied=%d restored=%d cb=%p",
++                          static_cast<unsigned long long>(ordinal),
++                          copied, restored, mAttachedColorBuffer.Ptr());
++    }
+     return copied && restored;
+ }
+diff --git a/ThirdParty/AndroidQemuCompat/qemu/android51_host.h b/ThirdParty/AndroidQemuCompat/qemu/android51_host.h
+--- a/ThirdParty/AndroidQemuCompat/qemu/android51_host.h
++++ b/ThirdParty/AndroidQemuCompat/qemu/android51_host.h
+@@ -31,3 +31,16 @@
+ uint64_t android51_host_metric(unsigned index);
+ bool android51_tcg_set_region(void *rw, void *rx, size_t bytes);
++
++/* Deep graphics pipeline diagnostics exposed by the embedded framework. */
++size_t android51_host_graphics_diagnostics(char *out, size_t capacity);
++void android51_host_clear_graphics_diagnostics(void);
++void android51_host_graphics_mark(const char *label);
++void android51_host_graphics_note_frame(const uint8_t *pixels,
++                                        size_t stride,
++                                        uint32_t frame_width,
++                                        uint32_t frame_height,
++                                        uint32_t x,
++                                        uint32_t y,
++                                        uint32_t width,
++                                        uint32_t height);
+ /* Internal device hooks; callbacks remain installed until CPUs are stopped. */
+diff --git a/ThirdParty/AndroidQemuCompat/qemu/gpu.h b/ThirdParty/AndroidQemuCompat/qemu/gpu.h
+--- a/ThirdParty/AndroidQemuCompat/qemu/gpu.h
++++ b/ThirdParty/AndroidQemuCompat/qemu/gpu.h
+@@ -14,3 +14,14 @@
+ static inline void ae_gpu_invalidate_frame(void) {}
+ static inline int ae_gpu_frame_region(uint8_t *p, size_t n, unsigned *first, unsigned *rows) { return 0; }
++static inline size_t ae_gpu_diagnostics_copy(char *out, size_t capacity) {
++    if (out && capacity) { out[0] = '\0'; } return 0;
++}
++static inline void ae_gpu_diagnostics_clear(void) {}
++static inline void ae_gpu_diagnostics_mark(const char *label) { (void)label; }
++static inline void ae_gpu_diagnostics_note_bgra_frame(
++        const uint8_t *p, size_t stride, unsigned fw, unsigned fh,
++        unsigned x, unsigned y, unsigned w, unsigned h) {
++    (void)p; (void)stride; (void)fw; (void)fh;
++    (void)x; (void)y; (void)w; (void)h;
++}
+ #endif
+diff --git a/ThirdParty/AndroidQemuCompat/qemu/host.c b/ThirdParty/AndroidQemuCompat/qemu/host.c
+--- a/ThirdParty/AndroidQemuCompat/qemu/host.c
++++ b/ThirdParty/AndroidQemuCompat/qemu/host.c
+@@ -20,2 +20,26 @@
+ uint64_t android51_host_metric(unsigned index) { return index < 3 ? qatomic_read(&metrics[index]) : 0; }
++size_t android51_host_graphics_diagnostics(char *out, size_t capacity)
++{
++    return ae_gpu_diagnostics_copy(out, capacity);
++}
++void android51_host_clear_graphics_diagnostics(void)
++{
++    ae_gpu_diagnostics_clear();
++}
++void android51_host_graphics_mark(const char *label)
++{
++    ae_gpu_diagnostics_mark(label);
++}
++void android51_host_graphics_note_frame(const uint8_t *pixels,
++                                        size_t stride,
++                                        uint32_t frame_width,
++                                        uint32_t frame_height,
++                                        uint32_t x,
++                                        uint32_t y,
++                                        uint32_t w,
++                                        uint32_t h)
++{
++    ae_gpu_diagnostics_note_bgra_frame(
++            pixels, stride, frame_width, frame_height, x, y, w, h);
++}
+ static QEMUTimer *poll_timer;
+diff --git a/scripts/package_engine_frameworks.py b/scripts/package_engine_frameworks.py
+--- a/scripts/package_engine_frameworks.py
++++ b/scripts/package_engine_frameworks.py
+@@ -12,2 +12,4 @@
+     'android51_host_metric', 'android51_tcg_set_region',
++    'android51_host_graphics_diagnostics', 'android51_host_clear_graphics_diagnostics',
++    'android51_host_graphics_mark', 'android51_host_graphics_note_frame',
+     'android51_adb_connected', 'android51_adb_disconnect',
+diff --git a/scripts/ios_dependency_key.py b/scripts/ios_dependency_key.py
+--- a/scripts/ios_dependency_key.py
++++ b/scripts/ios_dependency_key.py
+@@ -12,3 +12,8 @@
+     for name in ('ThirdParty/dependencies.lock.json', 'scripts/prepare_ios_sysroot.py',
+                  'scripts/prepare_angle.py', 'scripts/angle_metal_image.py', 'scripts/normalize_angle.py',
++                 'ThirdParty/EmuGL/Bridge.cpp', 'ThirdParty/EmuGL/Bridge.h',
++                 'ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/GraphicsDiagnostics.h',
++                 'ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/ColorBuffer.cpp',
++                 'ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/FrameBuffer.cpp',
++                 'ThirdParty/EmuGL/upstream/host/libs/libOpenglRender/WindowSurface.cpp',
+                  'scripts/build_qemu_ios.sh', 'scripts/ios_dependency_key.py'):
+diff --git a/QEMUBridge/VMController.h b/QEMUBridge/VMController.h
+--- a/QEMUBridge/VMController.h
++++ b/QEMUBridge/VMController.h
+@@ -8,2 +8,3 @@
+ @property(nonatomic, readonly) NSString *serialText;
++@property(nonatomic, readonly) NSString *graphicsDiagnosticsText;
+ @property(nonatomic, readonly) BOOL engineAvailable;
+@@ -17,2 +18,4 @@
+ - (void)sendGuestKey:(uint16_t)code pressed:(BOOL)pressed NS_SWIFT_NAME(sendGuestKey(_:pressed:));
++- (void)clearGraphicsDiagnostics;
++- (void)markGraphicsDiagnostics;
+ - (NSDictionary<NSString *, NSNumber *> *)statistics;
+diff --git a/QEMUBridge/VMController.mm b/QEMUBridge/VMController.mm
+--- a/QEMUBridge/VMController.mm
++++ b/QEMUBridge/VMController.mm
+@@ -50,3 +50,10 @@
+     setGraphicsDiagnostic(defaults, @"graphics.diag.forceFullHostFrame", "AE_DIAG_FORCE_FULL_HOST_FRAME");
+     setGraphicsDiagnostic(defaults, @"graphics.diag.visualizeAlpha", "AE_DIAG_VISUALIZE_ALPHA");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.tracePipeline", "AE_DIAG_TRACE_PIPELINE");
++    setGraphicsDiagnostic(defaults, @"graphics.diag.pixelFingerprints", "AE_DIAG_PIXEL_FINGERPRINTS");
++    NSInteger traceEvery = [defaults integerForKey:@"graphics.diag.traceEvery"];
++    if (traceEvery < 1 || traceEvery > 600) traceEvery = 30;
++    char traceEveryText[16];
++    snprintf(traceEveryText, sizeof(traceEveryText), "%ld", (long)traceEvery);
++    setenv("AE_DIAG_TRACE_EVERY", traceEveryText, 1);
+     fprintf(stderr,
+@@ -68,3 +75,7 @@
+             getenv("AE_DIAG_FORCE_FULL_HOST_FRAME") != nullptr,
+             getenv("AE_DIAG_VISUALIZE_ALPHA") != nullptr);
++    fprintf(stderr, "AEGFXDIAG deep trace=%d pixels=%d every=%s\n",
++            getenv("AE_DIAG_TRACE_PIPELINE") != nullptr,
++            getenv("AE_DIAG_PIXEL_FINGERPRINTS") != nullptr,
++            traceEveryText);
+ }
+@@ -87,3 +98,8 @@
+     uint64_t (*_metric)(unsigned);
+     bool (*_region)(void *, void *, size_t);
++    size_t (*_graphicsDiagnostics)(char *, size_t);
++    void (*_graphicsClear)(void);
++    void (*_graphicsMark)(const char *);
++    void (*_graphicsNoteFrame)(const uint8_t *, size_t, uint32_t, uint32_t,
++                               uint32_t, uint32_t, uint32_t, uint32_t);
+     BOOL _started, _stopped, _guestPaused;
+@@ -113,4 +129,16 @@
+     auto text = emu::logUTF8(static_cast<const uint8_t *>(copy.bytes), copy.length);
+     return [[NSString alloc] initWithBytes:text.data() length:text.size() encoding:NSUTF8StringEncoding] ?: @"";
+ }
++- (NSString *)graphicsDiagnosticsText {
++    if (!_graphicsDiagnostics) return @"描画診断ログはまだ利用できません。";
++    std::vector<char> buffer(512 * 1024 + 1);
++    size_t bytes = _graphicsDiagnostics(buffer.data(), buffer.size());
++    if (!bytes) return @"描画診断ログは空です。設定で詳細パイプライントレースを有効にして、Androidを起動し直してください。";
++    bytes = MIN(bytes, buffer.size() - 1);
++    return [[NSString alloc] initWithBytes:buffer.data()
++                                   length:bytes
++                                 encoding:NSUTF8StringEncoding] ?: @"描画診断ログのUTF-8変換に失敗しました。";
++}
++- (void)clearGraphicsDiagnostics { if (_graphicsClear) _graphicsClear(); }
++- (void)markGraphicsDiagnostics { if (_graphicsMark) _graphicsMark("USER_SAW_NOISE"); }
+ - (BOOL)prefersStatusBarHidden { return YES; }
+@@ -226,3 +254,11 @@
+     _metric = reinterpret_cast<decltype(_metric)>(resolve("android51_host_metric"));
+     _region = reinterpret_cast<decltype(_region)>(resolve("android51_tcg_set_region"));
++    _graphicsDiagnostics = reinterpret_cast<decltype(_graphicsDiagnostics)>(
++            resolve("android51_host_graphics_diagnostics"));
++    _graphicsClear = reinterpret_cast<decltype(_graphicsClear)>(
++            resolve("android51_host_clear_graphics_diagnostics"));
++    _graphicsMark = reinterpret_cast<decltype(_graphicsMark)>(
++            resolve("android51_host_graphics_mark"));
++    _graphicsNoteFrame = reinterpret_cast<decltype(_graphicsNoteFrame)>(
++            resolve("android51_host_graphics_note_frame"));
+     for (const char *name : {"android51_adb_connected", "android51_adb_disconnect",
+@@ -330,3 +366,6 @@
+ - (void)hostFrame:(const uint8_t *)p stride:(size_t)s x:(uint32_t)x y:(uint32_t)y width:(uint32_t)w height:(uint32_t)h {
++    if (_graphicsNoteFrame) {
++        _graphicsNoteFrame(p, s, _width, _height, x, y, w, h);
++    }
+     if ([_display submitPixels:p length:s * _height stride:s x:x y:y width:w height:h]) [_metrics receivedFrameBytes:(uint64_t)w * h * 4];
+ }
+diff --git a/App/LibrarySettingsView.swift b/App/LibrarySettingsView.swift
+--- a/App/LibrarySettingsView.swift
++++ b/App/LibrarySettingsView.swift
+@@ -16,3 +16,6 @@
+     @AppStorage("graphics.diag.forceFullHostFrame") private var diagForceFullHostFrame = false
+     @AppStorage("graphics.diag.visualizeAlpha") private var diagVisualizeAlpha = false
++    @AppStorage("graphics.diag.tracePipeline") private var diagTracePipeline = false
++    @AppStorage("graphics.diag.pixelFingerprints") private var diagPixelFingerprints = false
++    @AppStorage("graphics.diag.traceEvery") private var diagTraceEvery = 30
+     var body: some View {
+@@ -52,2 +55,13 @@
+             Section {
++                Toggle("詳細パイプライントレース", isOn: $diagTracePipeline)
++                Toggle("画素ハッシュ・α統計を採取（重い）", isOn: $diagPixelFingerprints)
++                Picker("ログ採取間隔", selection: $diagTraceEvery) {
++                    Text("毎フレーム").tag(1)
++                    Text("5フレームごと").tag(5)
++                    Text("30フレームごと").tag(30)
++                    Text("120フレームごと").tag(120)
++                }
++                .disabled(!diagTracePipeline && !diagPixelFingerprints)
++                Text("画素ハッシュONではreverse EGLImageの前後、forward EGLImageのsource/import直後、最終post、QEMU→iOS callbackのRGBA/RGB/αハッシュと4×4領域fingerprintを記録します。短時間だけ「毎フレーム」にすると最も詳しく追跡できます。")
++                    .font(.footnote).foregroundStyle(.secondary)
+                 Toggle("reverse EGLImageをCPUコピーに置換", isOn: $diagCPUReverseBlit)
+@@ -78,3 +92,6 @@
+                     diagForceFullHostFrame = false
+                     diagVisualizeAlpha = false
++                    diagTracePipeline = false
++                    diagPixelFingerprints = false
++                    diagTraceEvery = 30
+                 }
+
+diff --git a/App/RuntimeView.swift b/App/RuntimeView.swift
+--- a/App/RuntimeView.swift
++++ b/App/RuntimeView.swift
+@@ -107,2 +107,5 @@
+                         NavigationLink("シリアルログ") { RuntimeLogView(text: runtime.controller.serialText) }
++                        NavigationLink("描画パイプラインログ") {
++                            RuntimeGraphicsDiagnosticsView(controller: runtime.controller)
++                        }
+                     }
+@@ -220,2 +223,40 @@
++private struct RuntimeGraphicsDiagnosticsView: View {
++    let controller: AEVMController
++    @State private var text = ""
++
++    var body: some View {
++        ScrollView {
++            Text(text)
++                .font(.caption2.monospaced())
++                .textSelection(.enabled)
++                .frame(maxWidth: .infinity, alignment: .leading)
++                .padding()
++        }
++        .navigationTitle("描画パイプライン")
++        .toolbar {
++            Button("ノイズ地点をマーク") {
++                controller.markGraphicsDiagnostics()
++                refresh()
++            }
++            Button("消去") {
++                controller.clearGraphicsDiagnostics()
++                refresh()
++            }
++            ShareLink(item: text)
++        }
++        .task {
++            refresh()
++            while !Task.isCancelled {
++                try? await Task.sleep(for: .seconds(1))
++                refresh()
++            }
++        }
++    }
++
++    private func refresh() {
++        text = controller.graphicsDiagnosticsText
++    }
++}
++
+ private struct RuntimeLogView: View {
+     let text: String
