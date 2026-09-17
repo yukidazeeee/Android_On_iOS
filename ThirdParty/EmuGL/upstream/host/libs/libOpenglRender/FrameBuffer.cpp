@@ -25,6 +25,7 @@
 #include "TimeUtils.h"
 
 #include <stdio.h>
+#include <atomic>
 
 namespace {
 bool hasExtension(const char *extensions, const char *name) {
