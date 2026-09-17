@@ -1,0 +1,34 @@
+diff --git a/ThirdParty/AndroidQemuCompat/patches/0006-export-graphics-preflight.patch b/ThirdParty/AndroidQemuCompat/patches/0006-export-graphics-preflight.patch
+index 89035d9..66a6374 100644
+--- a/ThirdParty/AndroidQemuCompat/patches/0006-export-graphics-preflight.patch
++++ b/ThirdParty/AndroidQemuCompat/patches/0006-export-graphics-preflight.patch
+@@ -1,19 +1,24 @@
+ From: AndroidEmu contributors
+-Subject: [PATCH] system: export graphics preflight to the embedding application
++Subject: [PATCH] system: export graphics entry points to the embedding application
+ 
+-The app resolves this entry point before starting QEMU. Darwin's explicit
+-export list must retain it even though QEMU itself does not call it.
+-Keep this separate from 0005 so previously prepared checkouts can update.
++The app resolves graphics preflight and deep diagnostics entry points before
++or while running QEMU. Darwin's explicit export list must retain them even
++though QEMU itself does not call them. Keep this separate from 0005 so
++previously prepared checkouts can update.
+ 
+ SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ --- a/system/qemu.symbols
+ +++ b/system/qemu.symbols
+-@@ -11,6 +11,7 @@
++@@ -11,6 +11,11 @@
+    qemu_init;
+    qemu_main_loop;
+    qemu_cleanup;
+ +  android51_host_prepare_graphics;
+++  android51_host_graphics_diagnostics;
+++  android51_host_clear_graphics_diagnostics;
+++  android51_host_graphics_mark;
+++  android51_host_graphics_note_frame;
+    bql_lock_impl;
+    bql_unlock;
+    g_assertion_message_expr;
