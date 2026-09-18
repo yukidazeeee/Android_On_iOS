@@ -36,7 +36,8 @@ public:
     static WindowSurface* create(EGLDisplay display,
                                  EGLConfig config,
                                  int width,
-                                 int height);
+                                 int height,
+                                 EGLContext restoreShareContext);
 
     // Destructor.
     ~WindowSurface();
@@ -55,6 +56,11 @@ public:
     // Poison newly attached backing storage with magenta when requested.
     // Undrawn/preserved regions then become visually obvious.
     void applyDiagnosticAttachClear();
+
+    // AndroidEmu ColorBuffer -> PBuffer restore v3
+    // Restore the newly attached gralloc ColorBuffer into this window's host
+    // PBuffer before the guest performs a partial redraw.
+    bool restoreColorBuffer();
 
     // Copy the Pbuffer's pixels to the attached color buffer.
     // Returns true on success, or false on error (e.g. if there is no
@@ -100,6 +106,11 @@ private:
     GLuint mHeight;
     EGLConfig mConfig;
     EGLDisplay mDisplay;
+    // Dedicated ES2 context using this surface's exact EGLConfig. It shares
+    // objects with FrameBuffer's helper context, so ColorBuffer::m_tex and
+    // TextureDraw's program/buffers are valid here without depending on guest
+    // context sharing.
+    EGLContext mRestoreContext;
     bool mDiagnosticClearPending;
 };
 

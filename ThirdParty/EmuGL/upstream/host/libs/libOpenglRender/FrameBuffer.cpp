@@ -600,8 +600,16 @@ HandleType FrameBuffer::createWindowSurface(int p_config, int p_width, int p_hei
         return ret;
     }
 
+    // AndroidEmu ColorBuffer -> PBuffer restore v3
+    // The restore renderer is GLES2 and must share ColorBuffer/TextureDraw GL
+    // objects with the helper context. GLES1-only configs retain the legacy
+    // behavior by passing EGL_NO_CONTEXT.
+    const EGLContext restoreShareContext =
+            (config->getRenderableType() & EGL_OPENGL_ES2_BIT)
+                    ? m_pbufContext : EGL_NO_CONTEXT;
     WindowSurfacePtr win(WindowSurface::create(
-            getDisplay(), config->getEglConfig(), p_width, p_height));
+            getDisplay(), config->getEglConfig(), p_width, p_height,
+            restoreShareContext));
     if (win.Ptr() != NULL) {
         ret = genHandle();
         m_windows[ret] = win;
@@ -750,7 +758,18 @@ bool FrameBuffer::setWindowSurfaceColorBuffer(HandleType p_surface,
                           p_colorbuffer, (*c).second.cb.Ptr());
     }
     (*w).second->setColorBuffer((*c).second.cb);
-    return true;
+
+    // Restore this particular BufferQueue slot's previous pixels before the
+    // guest starts its next partial redraw. Without this, one host PBuffer is
+    // reused across A/B/C ColorBuffers and untouched regions inherit pixels
+    // from the wrong slot (or the magenta diagnostic poison).
+    const bool restored = (*w).second->restoreColorBuffer();
+    if (aeGraphicsDiagTraceEnabled()) {
+        aeGraphicsDiagLog("FB_RESTORE_WINDOW_CB",
+                          "surface=%#x colorbuffer=%#x restored=%d",
+                          p_surface, p_colorbuffer, restored);
+    }
+    return restored;
 }
 
 void FrameBuffer::readColorBuffer(HandleType p_colorbuffer,

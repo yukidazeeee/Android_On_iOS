@@ -39,16 +39,25 @@ WindowSurface::WindowSurface(EGLDisplay display,
         mHeight(0),
         mConfig(config),
         mDisplay(display),
+        mRestoreContext(EGL_NO_CONTEXT),
         mDiagnosticClearPending(false) {}
 
 WindowSurface::~WindowSurface() {
-    s_egl.eglDestroySurface(mDisplay, mSurface);
+    if (mRestoreContext != EGL_NO_CONTEXT) {
+        s_egl.eglDestroyContext(mDisplay, mRestoreContext);
+        mRestoreContext = EGL_NO_CONTEXT;
+    }
+    if (mSurface != EGL_NO_SURFACE) {
+        s_egl.eglDestroySurface(mDisplay, mSurface);
+        mSurface = EGL_NO_SURFACE;
+    }
 }
 
 WindowSurface *WindowSurface::create(EGLDisplay display,
                                      EGLConfig config,
                                      int p_width,
-                                     int p_height) {
+                                     int p_height,
+                                     EGLContext restoreShareContext) {
     // allocate space for the WindowSurface object
     WindowSurface *win = new WindowSurface(display, config);
     if (!win) {
@@ -62,7 +71,123 @@ WindowSurface *WindowSurface::create(EGLDisplay display,
         return NULL;
     }
 
+    // AndroidEmu ColorBuffer -> PBuffer restore v3
+    // The normal guest RenderContext is not necessarily in the same GL share
+    // group as ColorBuffer::m_tex. Create an ES2 context using the exact
+    // WindowSurface EGLConfig, but share it with FrameBuffer's helper group.
+    // This lets us draw the target ColorBuffer into this PBuffer reliably.
+    if (restoreShareContext != EGL_NO_CONTEXT) {
+        const EGLint restoreAttribs[] = {
+            EGL_CONTEXT_CLIENT_VERSION, 2,
+            EGL_NONE
+        };
+        win->mRestoreContext = s_egl.eglCreateContext(
+                display, config, restoreShareContext, restoreAttribs);
+        if (win->mRestoreContext == EGL_NO_CONTEXT) {
+            fprintf(stderr,
+                    "Renderer error: failed to create ColorBuffer restore "
+                    "context eglError=%#x\n",
+                    s_egl.eglGetError());
+            delete win;
+            return NULL;
+        }
+    }
+
     return win;
+}
+
+
+// AndroidEmu ColorBuffer -> PBuffer restore v3
+bool WindowSurface::restoreColorBuffer() {
+    if (!mAttachedColorBuffer.Ptr()) {
+        return true;
+    }
+
+    // GLES1-only configs cannot share/use TextureDraw's ES2 objects. They keep
+    // the legacy path; Android 5/6 SurfaceFlinger/HWUI normally use ES2.
+    if (mRestoreContext == EGL_NO_CONTEXT) {
+        if (aeGraphicsDiagTraceEnabled()) {
+            aeGraphicsDiagLog("WIN_RESTORE_CB",
+                              "win=%p cb=%p skipped=no-es2-restore-context",
+                              this, mAttachedColorBuffer.Ptr());
+        }
+        return true;
+    }
+
+    if (!mWidth || !mHeight ||
+        mAttachedColorBuffer->getWidth() != mWidth ||
+        mAttachedColorBuffer->getHeight() != mHeight) {
+        fprintf(stderr, "Renderer error: restore ColorBuffer dimensions mismatch\n");
+        return false;
+    }
+
+    const EGLContext prevContext = s_egl.eglGetCurrentContext();
+    const EGLSurface prevReadSurf = s_egl.eglGetCurrentSurface(EGL_READ);
+    const EGLSurface prevDrawSurf = s_egl.eglGetCurrentSurface(EGL_DRAW);
+
+    if (!s_egl.eglMakeCurrent(
+                mDisplay, mSurface, mSurface, mRestoreContext)) {
+        fprintf(stderr,
+                "Renderer error: failed to bind ColorBuffer restore context "
+                "eglError=%#x\n",
+                s_egl.eglGetError());
+        return false;
+    }
+
+    GLint previousFbo = 0;
+    GLint previousViewport[4] = {0, 0, 0, 0};
+    s_gles2.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFbo);
+    s_gles2.glGetIntegerv(GL_VIEWPORT, previousViewport);
+
+    s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    s_gles2.glViewport(0, 0, mWidth, mHeight);
+    s_gles2.glDisable(GL_SCISSOR_TEST);
+    s_gles2.glDisable(GL_BLEND);
+    s_gles2.glDisable(GL_DEPTH_TEST);
+    s_gles2.glDisable(GL_STENCIL_TEST);
+    s_gles2.glDisable(GL_CULL_FACE);
+    s_gles2.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    if (mDiagnosticClearPending) {
+        GLfloat previousClearColor[4] = {0, 0, 0, 0};
+        s_gles2.glGetFloatv(GL_COLOR_CLEAR_VALUE, previousClearColor);
+        s_gles2.glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+        s_gles2.glClear(GL_COLOR_BUFFER_BIT);
+        s_gles2.glClearColor(previousClearColor[0],
+                             previousClearColor[1],
+                             previousClearColor[2],
+                             previousClearColor[3]);
+        mDiagnosticClearPending = false;
+    }
+
+    if (aeGraphicsDiagTraceEnabled()) {
+        aeGraphicsDiagLog("WIN_RESTORE_CB_BEGIN",
+                          "win=%p pbuffer=%p cb=%p size=%ux%u ctx=%p",
+                          this, mSurface, mAttachedColorBuffer.Ptr(),
+                          mWidth, mHeight, mRestoreContext);
+    }
+
+    s_gles2.glGetError();
+    const bool drawn = mAttachedColorBuffer->post(0.0f);
+    s_gles2.glFinish();
+    const GLenum restoreError = s_gles2.glGetError();
+
+    s_gles2.glBindFramebuffer(
+            GL_FRAMEBUFFER, static_cast<GLuint>(previousFbo));
+    s_gles2.glViewport(previousViewport[0], previousViewport[1],
+                       previousViewport[2], previousViewport[3]);
+
+    const bool contextRestored = s_egl.eglMakeCurrent(
+            mDisplay, prevDrawSurf, prevReadSurf, prevContext);
+
+    if (aeGraphicsDiagTraceEnabled()) {
+        aeGraphicsDiagLog("WIN_RESTORE_CB_END",
+                          "win=%p cb=%p drawn=%d glError=%#x contextRestored=%d",
+                          this, mAttachedColorBuffer.Ptr(),
+                          drawn, restoreError, contextRestored);
+    }
+
+    return drawn && restoreError == GL_NO_ERROR && contextRestored;
 }
 
 
