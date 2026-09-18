@@ -22,6 +22,7 @@
 #include "GLESv1Dispatch.h"
 #include "GLESv2Dispatch.h"
 
+#include <GLES2/gl2.h>
 #include <GLES/glext.h>
 
 #include <stdio.h>
