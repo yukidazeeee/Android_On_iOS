@@ -3,6 +3,22 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      app_name:
+        description: Installed app name
+        required: false
+        default: AndroidEmu
+        type: string
+      bundle_id:
+        description: iOS bundle identifier
+        required: false
+        default: org.androidemu.app
+        type: string
+      icon_url:
+        description: Optional HTTPS PNG/JPEG app icon URL (1024px or larger)
+        required: false
+        default: ""
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -126,6 +142,16 @@ jobs:
             !build/ios-dependencies/build-iOS-arm64/**/.git
             !build/ios-dependencies/build-iOS-arm64/**/utm_build
             !build/ios-dependencies/build-iOS-arm64/**/ANGLE.xcarchive
+      - name: Configure app identity
+        env:
+          APP_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.app_name || 'AndroidEmu' }}
+          APP_BUNDLE_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_id || 'org.androidemu.app' }}
+          APP_ICON_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.icon_url || '' }}
+        run: |
+          python3 scripts/configure_app_build.py \
+            --name "$APP_NAME" \
+            --bundle-id "$APP_BUNDLE_ID" \
+            --icon-url "$APP_ICON_URL"
       - name: Build unsigned iPhoneOS application
         shell: bash
         run: |
@@ -138,6 +164,7 @@ jobs:
           git archive --format=tar.gz --output=build/artifacts/AndroidEmu-source.tar.gz HEAD
           python3 scripts/collect_engine_source.py
           cp build/guest-kernel/goldfish-kernel-source.tar.gz build/guest-kernel/goldfish-highmem.config build/guest-kernel/goldfish-kernel-build.txt build/artifacts/
+          if [[ -f build/app-customization.json ]]; then cp build/app-customization.json build/artifacts/; fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: AndroidEmu-development-unsigned

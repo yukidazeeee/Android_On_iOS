@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """Deterministic, dependency-free Xcode project for the implemented app targets."""
 import hashlib
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def app_customization():
+    values = {"app_name": "AndroidEmu", "bundle_id": "org.androidemu.app"}
+    path = ROOT / "build/app-customization.json"
+    if path.is_file():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded.get("app_name"), str) and loaded["app_name"]:
+            values["app_name"] = loaded["app_name"]
+        if isinstance(loaded.get("bundle_id"), str) and loaded["bundle_id"]:
+            values["bundle_id"] = loaded["bundle_id"]
+    return values
 
 def ident(name):
     return hashlib.sha256(name.encode()).hexdigest()[:24].upper()
@@ -12,6 +24,7 @@ def quote(text):
     return '"' + text.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 def generate():
+    customization = app_customization()
     files = []
     for folder in ('App', 'Core', 'ImageKit', 'JIT', 'QEMUBridge', 'Display', 'Input', 'Audio', 'ADB', 'Network', 'Performance', 'ThirdParty/StikJITProtocol'):
         files.extend(p.relative_to(ROOT).as_posix() for p in (ROOT / folder).rglob('*') if p.suffix in ('.swift', '.cpp', '.mm', '.c', '.metal'))
@@ -32,10 +45,15 @@ def generate():
         obj(name, f'isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = System/Library/Frameworks/{name}.framework; sourceTree = SDKROOT;')
         obj('link:' + name, f'isa = PBXBuildFile; fileRef = {ident(name)};')
     resource_refs, resource_builds = [], []
-    for resource in ['LICENSE', 'THIRD_PARTY_NOTICES.md', 'ThirdParty/StikJITProtocol/MPL-2.0.txt',
-                     'build/guest-kernel/goldfish-highmem.zImage', 'build/guest-kernel/goldfish-kernel-COPYING.txt']:
+    resources = ['LICENSE', 'THIRD_PARTY_NOTICES.md', 'ThirdParty/StikJITProtocol/MPL-2.0.txt',
+                 'build/guest-kernel/goldfish-highmem.zImage', 'build/guest-kernel/goldfish-kernel-COPYING.txt']
+    icon_catalog = ROOT / 'build/AppAssets.xcassets'
+    if icon_catalog.is_dir():
+        resources.append('build/AppAssets.xcassets')
+    for resource in resources:
         resource_refs.append(ident(resource)); resource_builds.append(ident('resource:' + resource))
-        obj(resource, f'isa = PBXFileReference; lastKnownFileType = text; path = {quote(resource)}; sourceTree = SOURCE_ROOT;')
+        file_type = 'folder.assetcatalog' if resource.endswith('.xcassets') else 'text'
+        obj(resource, f'isa = PBXFileReference; lastKnownFileType = {file_type}; path = {quote(resource)}; sourceTree = SOURCE_ROOT;')
         obj('resource:' + resource, f'isa = PBXBuildFile; fileRef = {ident(resource)};')
     obj('product', 'isa = PBXFileReference; explicitFileType = wrapper.application; path = AndroidEmu.app; sourceTree = BUILT_PRODUCTS_DIR;')
     obj('products', f'isa = PBXGroup; children = ({ident("product")},); name = Products; sourceTree = "<group>";')
@@ -52,12 +70,15 @@ def generate():
         'GCC_TREAT_WARNINGS_AS_ERRORS': 'YES', 'SWIFT_TREAT_WARNINGS_AS_ERRORS': 'YES',
         'CLANG_WARN_DOCUMENTATION_COMMENTS': 'YES', 'CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF': 'YES',
         'ENABLE_USER_SCRIPT_SANDBOXING': 'YES', 'CODE_SIGNING_ALLOWED': 'NO', 'CODE_SIGNING_REQUIRED': 'NO',
-        'PRODUCT_BUNDLE_IDENTIFIER': 'org.androidemu.app', 'PRODUCT_NAME': 'AndroidEmu',
+        'PRODUCT_BUNDLE_IDENTIFIER': customization['bundle_id'], 'PRODUCT_NAME': 'AndroidEmu',
+        'APP_DISPLAY_NAME': customization['app_name'],
         'INFOPLIST_FILE': 'App/Info.plist', 'GENERATE_INFOPLIST_FILE': 'NO',
         'SWIFT_OBJC_BRIDGING_HEADER': 'QEMUBridge/NativeBridge.h', 'HEADER_SEARCH_PATHS': '$(SRCROOT)',
         'LD_RUNPATH_SEARCH_PATHS': '@executable_path/Frameworks',
         'CODE_SIGN_ENTITLEMENTS': 'AndroidEmu.entitlements', 'ENABLE_BITCODE': 'NO',
     }
+    if icon_catalog.is_dir():
+        common['ASSETCATALOG_COMPILER_APPICON_NAME'] = 'AppIcon'
     for mode in ('Debug', 'Release'):
         settings = dict(common)
         settings.update({'SWIFT_OPTIMIZATION_LEVEL': '-Onone' if mode == 'Debug' else '-O',

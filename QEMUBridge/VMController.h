@@ -12,7 +12,13 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) BOOL started;
 @property(nonatomic, readonly) BOOL stopped;
 @property(nonatomic, readonly) BOOL guestPaused;
-- (BOOL)startWithImageDirectory:(NSString *)path ramMiB:(uint32_t)ram cacheMiB:(uint32_t)cache panelWidth:(uint32_t)width NS_SWIFT_NAME(start(imageDirectory:ramMiB:cacheMiB:panelWidth:));
+- (BOOL)startWithImageDirectory:(NSString *)path
+                            ramMiB:(uint32_t)ram
+                          cacheMiB:(uint32_t)cache
+                        panelWidth:(uint32_t)width
+                       panelHeight:(uint32_t)height
+                          apiLevel:(uint32_t)apiLevel
+    NS_SWIFT_NAME(start(imageDirectory:ramMiB:cacheMiB:panelWidth:panelHeight:apiLevel:));
 - (void)setGuestPaused:(BOOL)paused;
 - (void)stopGuest;
 - (void)sendGuestKey:(uint16_t)code pressed:(BOOL)pressed NS_SWIFT_NAME(sendGuestKey(_:pressed:));

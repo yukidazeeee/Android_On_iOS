@@ -174,9 +174,19 @@ struct LibraryView: View {
     }
     private func launch() {
         Task {
-            guard let profile = model.selectedProfile else { return }
-            if await runtime.start(configuration: model.configuration, directory: profile.directory) { showRuntime = true }
-            else { model.errorMessage = runtime.status }
+            guard let profile = model.selectedProfile,
+                  let manifest = model.manifest,
+                  let apiLevel = ImageProfile.api(for: manifest.profile) else {
+                model.errorMessage = "AndroidイメージのAPIレベルを確認できません。再取り込みしてください。"
+                return
+            }
+            if await runtime.start(configuration: model.configuration,
+                                   directory: profile.directory,
+                                   apiLevel: apiLevel) {
+                showRuntime = true
+            } else {
+                model.errorMessage = runtime.status
+            }
         }
     }
 }

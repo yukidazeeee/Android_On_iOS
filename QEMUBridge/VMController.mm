@@ -173,21 +173,41 @@ static void applyGraphicsDiagnosticEnvironment() {
     [super viewSafeAreaInsetsDidChange];
     [_input cancelTouches];
 }
-- (BOOL)startWithImageDirectory:(NSString *)path ramMiB:(uint32_t)ram cacheMiB:(uint32_t)cache panelWidth:(uint32_t)width {
+- (BOOL)startWithImageDirectory:(NSString *)path
+                            ramMiB:(uint32_t)ram
+                          cacheMiB:(uint32_t)cache
+                        panelWidth:(uint32_t)width
+                       panelHeight:(uint32_t)height
+                          apiLevel:(uint32_t)apiLevel {
     NSAssert([NSThread isMainThread], @"Launch must originate on UI thread");
     if (_started) { _statusText = @"再起動にはアプリを終了して開き直してください"; return NO; }
     if (!AEJITArenaReady()) { _statusText = @"先にJITを有効にしてください"; return NO; }
     if (ram < 512 || ram > 4096 || !(cache == 128 || cache == 192 || cache == 256)) {
         _statusText = @"非対応のメモリ設定です"; return NO;
     }
-    if (!(width == 360 || width == 480 || width == 540 || width == 720)) {
-        _statusText = @"非対応の画面幅です"; return NO;
+    const bool validPanel =
+            (width == 360 && height == 640) ||
+            (width == 480 && height == 854) ||
+            (width == 540 && height == 960) ||
+            (width == 720 && height == 1280);
+    if (!validPanel) {
+        _statusText = @"非対応のAndroid画面解像度です"; return NO;
     }
-    // Keep the supplied kernel for ordinary configurations. The separately
-    // built HIGHMEM kernel is required above the stock kernel's lowmem limit.
+    const bool validApi =
+            (apiLevel >= 14 && apiLevel <= 19) ||
+            (apiLevel >= 21 && apiLevel <= 23);
+    if (!validApi) {
+        _statusText = @"非対応のAndroid APIレベルです"; return NO;
+    }
+    // Android 4.x compatibility: keep the kernel shipped with that exact
+    // system image. The newer optional HIGHMEM kernel is reserved for 5/6;
+    // pairing it with old 4.x ramdisks can change their expected kernel ABI.
+    const bool android4Compat = apiLevel <= 19;
     ram = MIN(ram, 4080U); // ARMv7 Goldfish reserves its top 16 MiB for MMIO.
     NSString *kernelPath = [path stringByAppendingPathComponent:@"kernel"];
-    if (ram > 760) {
+    if (android4Compat) {
+        ram = MIN(ram, 760U);
+    } else if (ram > 760) {
         kernelPath = [NSBundle.mainBundle pathForResource:@"goldfish-highmem" ofType:@"zImage"];
         if (!kernelPath) {
             _statusText = @"HIGHMEM対応カーネルが同梱されていません。最新版のIPAを使うか、メモリを760 MiB以下にしてください。";
@@ -195,8 +215,9 @@ static void applyGraphicsDiagnosticEnvironment() {
         }
     }
     uint64_t available = AEAvailableMemory();
-    // Leave headroom for the renderer, disk I/O and UIKit. Never silently lower
-    // the requested memory and then report it as having been allocated.
+    // Leave headroom for the renderer, disk I/O and UIKit. Android 4.x is the
+    // deliberate exception above: it is capped to the stock Goldfish lowmem
+    // range so the image's own kernel can be retained.
     if (available && ((uint64_t)ram + 256) * (1ULL << 20) > available) {
         _statusText = @"指定したAndroidメモリと描画処理に必要な空きメモリが不足しています。設定でメモリ容量を減らしてください。";
         return NO;
@@ -204,28 +225,16 @@ static void applyGraphicsDiagnosticEnvironment() {
     // Use the arena actually prepared (possibly enlarged by the optional
     // entitlement), rather than the user's pre-preparation preference.
     cache = (uint32_t)((AEJITArenaSize() + (1U << 20) - 1) >> 20);
-    // Use the active iPhone/iPad window ratio, with bounded guest pixels.
-    UIWindowScene *scene = nil;
-    for (UIScene *candidate in [UIApplication sharedApplication].connectedScenes) {
-        if ([candidate isKindOfClass:UIWindowScene.class] && candidate.activationState == UISceneActivationStateForegroundActive) {
-            scene = (UIWindowScene *)candidate; break;
-        }
+    // AndroidEmu workflow identity + fixed guest geometry v1
+    //
+    // VMConfiguration already defines a complete Android LCD resolution.
+    // Do not reshape the guest LCD to the iPhone/iPad window ratio: doing so
+    // can turn 360x640 into 360x480 on 4:3 iPads, clipping boot animations and
+    // exposing old Android SystemUI to an unintended panel geometry.
+    // MetalDisplay aspect-fits this stable guest panel to the host window.
+    if (self.isViewLoaded && (height != _height || width != _width)) {
+        self.view = nil; _display = nil; _input = nil;
     }
-    CGSize panel = CGSizeMake(540, 960);
-    UIWindow *window = self.viewIfLoaded.window ?: scene.keyWindow;
-    if (window) {
-        // Runtime hides the status bar and fills the window. Using the
-        // library's safe area here shortens the SE panel before presentation.
-        panel = window.bounds.size;
-    } else if (scene) {
-        if (@available(iOS 26.0, *)) { panel = scene.effectiveGeometry.coordinateSpace.bounds.size; }
-        else { panel = scene.coordinateSpace.bounds.size; }
-    }
-    // Goldfish cannot hotplug panel geometry. Keep a portrait virtual panel;
-    // window rotation/resizing aspect-fits it without cropping or coordinate drift.
-    if (panel.width > panel.height) { panel = CGSizeMake(panel.height, panel.width); }
-    uint32_t height = (uint32_t)(MIN(1600, MAX(480, width * panel.height / MAX(panel.width, 1))) / 2) * 2;
-    if (self.isViewLoaded && (height != _height || width != _width)) { self.view = nil; _display = nil; _input = nil; }
     _width = width; _height = height;
     [self loadViewIfNeeded];
     if (!_display) return NO;
@@ -276,13 +285,22 @@ static void applyGraphicsDiagnosticEnvironment() {
     if (!_region(AEJITWritableBase(), const_cast<void *>(AEJITExecutableBase()), AEJITArenaSize())) {
         [_audio stop]; _statusText = @"TCG領域の登録に失敗しました。アプリの再起動が必要です"; return NO;
     }
+    std::string kernelArgs =
+            "qemu=1 console=ttyS0 androidboot.console=ttyS0 "
+            "androidboot.hardware=goldfish android.qemud=1";
+    // Android 4.x used this explicit software-composition mode before the
+    // GLES renderer work. Keep 5/6 on the current GPU path, but restore the
+    // old Goldfish contract for API 14-19 to avoid SystemUI/HWUI regressions.
+    if (apiLevel <= 19) {
+        kernelArgs += " qemu.gles=0";
+    }
     std::vector<std::string> args = {"AndroidEmu", "-machine", "android51,audiodev=audio,width=" + std::to_string(_width) + ",height=" + std::to_string(_height), "-cpu", "cortex-a8",
         "-m", std::to_string(ram), "-smp", "1", "-accel", "tcg,tb-size=" + std::to_string(cache) + ",split-wx=on",
         "-nodefaults", "-no-reboot", "-display", "none", "-serial", "null", "-monitor", "none",
         "-audiodev", "none,id=audio", "-nic", emu::guestNICOption(),
         "-kernel", kernelPath.UTF8String,
         "-initrd", [path stringByAppendingPathComponent:@"ramdisk.img"].UTF8String,
-        "-append", "qemu=1 console=ttyS0 androidboot.console=ttyS0 androidboot.hardware=goldfish android.qemud=1"};
+        "-append", kernelArgs};
     for (NSString *name in disks) {
         args.emplace_back("-drive");
         args.push_back("if=none,id=" + std::string(name.UTF8String) + ",format=raw,file=" +

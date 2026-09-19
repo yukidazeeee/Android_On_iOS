@@ -14,15 +14,20 @@ import Combine
     private var startedAt: Date?
     @Published private(set) var elapsedSeconds = 0
     @Published private(set) var preparing = false
-    func start(configuration: VMConfiguration, directory root: URL) async -> Bool {
+    func start(configuration: VMConfiguration, directory root: URL, apiLevel: Int) async -> Bool {
         guard !preparing else { return false }
         preparing = true
         defer { preparing = false }
         status = "cache領域を準備中"
         do { try await ImageStore(root: root).ensureCache() }
         catch { status = error.localizedDescription; return false }
-        let success = controller.start(imageDirectory: root.path,
-            ramMiB: UInt32(configuration.ram.rawValue), cacheMiB: UInt32(configuration.cache.rawValue), panelWidth: UInt32(configuration.resolution.width))
+        let success = controller.start(
+            imageDirectory: root.path,
+            ramMiB: UInt32(configuration.ram.rawValue),
+            cacheMiB: UInt32(configuration.cache.rawValue),
+            panelWidth: UInt32(configuration.resolution.width),
+            panelHeight: UInt32(configuration.resolution.height),
+            apiLevel: UInt32(apiLevel))
         status = controller.statusText
         guard success else { return false }
         startedAt = Date()
