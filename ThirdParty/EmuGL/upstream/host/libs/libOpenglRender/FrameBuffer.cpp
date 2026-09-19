@@ -20,6 +20,7 @@
 #include "EGLDispatch.h"
 #include "GLESv1Dispatch.h"
 #include "GLESv2Dispatch.h"
+#include "GraphicsDiagnostics.h"
 #include "NativeSubWindow.h"
 #include "RenderThreadInfo.h"
 #include "TimeUtils.h"
