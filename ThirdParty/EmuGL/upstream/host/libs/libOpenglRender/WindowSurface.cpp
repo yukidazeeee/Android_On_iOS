@@ -34,6 +34,7 @@ WindowSurface::WindowSurface(EGLDisplay display,
                              EGLConfig config) :
         mSurface(NULL),
         mAttachedColorBuffer(NULL),
+        mAttachedColorBufferFlushed(false),
         mReadContext(NULL),
         mDrawContext(NULL),
         mWidth(0),
@@ -98,26 +99,24 @@ WindowSurface *WindowSurface::create(EGLDisplay display,
 }
 
 
-// AndroidEmu ColorBuffer -> PBuffer restore v3
-bool WindowSurface::restoreColorBuffer() {
-    if (!mAttachedColorBuffer.Ptr()) {
+// AndroidEmu previous-completed-frame restore v5
+bool WindowSurface::restoreColorBuffer(ColorBufferPtr p_colorBuffer) {
+    if (!p_colorBuffer.Ptr()) {
         return true;
     }
 
-    // GLES1-only configs cannot share/use TextureDraw's ES2 objects. They keep
-    // the legacy path; Android 5/6 SurfaceFlinger/HWUI normally use ES2.
     if (mRestoreContext == EGL_NO_CONTEXT) {
         if (aeGraphicsDiagTraceEnabled()) {
             aeGraphicsDiagLog("WIN_RESTORE_CB",
                               "win=%p cb=%p skipped=no-es2-restore-context",
-                              this, mAttachedColorBuffer.Ptr());
+                              this, p_colorBuffer.Ptr());
         }
         return true;
     }
 
     if (!mWidth || !mHeight ||
-        mAttachedColorBuffer->getWidth() != mWidth ||
-        mAttachedColorBuffer->getHeight() != mHeight) {
+        p_colorBuffer->getWidth() != mWidth ||
+        p_colorBuffer->getHeight() != mHeight) {
         fprintf(stderr, "Renderer error: restore ColorBuffer dimensions mismatch\n");
         return false;
     }
@@ -164,12 +163,12 @@ bool WindowSurface::restoreColorBuffer() {
     if (aeGraphicsDiagTraceEnabled()) {
         aeGraphicsDiagLog("WIN_RESTORE_CB_BEGIN",
                           "win=%p pbuffer=%p cb=%p size=%ux%u ctx=%p",
-                          this, mSurface, mAttachedColorBuffer.Ptr(),
+                          this, mSurface, p_colorBuffer.Ptr(),
                           mWidth, mHeight, mRestoreContext);
     }
 
     s_gles2.glGetError();
-    const bool drawn = mAttachedColorBuffer->post(0.0f);
+    const bool drawn = p_colorBuffer->post(0.0f);
     s_gles2.glFinish();
     const GLenum restoreError = s_gles2.glGetError();
 
@@ -184,7 +183,7 @@ bool WindowSurface::restoreColorBuffer() {
     if (aeGraphicsDiagTraceEnabled()) {
         aeGraphicsDiagLog("WIN_RESTORE_CB_END",
                           "win=%p cb=%p drawn=%d glError=%#x contextRestored=%d",
-                          this, mAttachedColorBuffer.Ptr(),
+                          this, p_colorBuffer.Ptr(),
                           drawn, restoreError, contextRestored);
     }
 
@@ -193,23 +192,40 @@ bool WindowSurface::restoreColorBuffer() {
 
 
 void WindowSurface::setColorBuffer(ColorBufferPtr p_colorBuffer) {
-    ColorBuffer *previous = mAttachedColorBuffer.Ptr();
+    // AndroidEmu previous-completed-frame restore v5
+    // Use the ColorBuffer that flushColorBuffer() just filled from the
+    // immediately previous completed frame. Restoring the newly dequeued
+    // BufferQueue slot instead can rewind untouched regions by several frames.
+    ColorBufferPtr previous = mAttachedColorBuffer;
+    const bool previousCompleted = mAttachedColorBufferFlushed;
+
+    const unsigned int cbWidth = p_colorBuffer->getWidth();
+    const unsigned int cbHeight = p_colorBuffer->getHeight();
+
+    bool sizeReady = true;
+    if (cbWidth != mWidth || cbHeight != mHeight) {
+        sizeReady = resize(cbWidth, cbHeight);
+    }
+
+    bool restoredPrevious = true;
+    if (sizeReady && previousCompleted && previous.Ptr() &&
+        previous->getWidth() == mWidth &&
+        previous->getHeight() == mHeight) {
+        restoredPrevious = restoreColorBuffer(previous);
+    }
+
     mAttachedColorBuffer = p_colorBuffer;
+    mAttachedColorBufferFlushed = false;
+
     if (aeGraphicsDiagTraceEnabled()) {
         aeGraphicsDiagLog("WIN_ATTACH_CB",
-                          "win=%p pbuffer=%p oldCb=%p newCb=%p size=%ux%u",
-                          this, mSurface, previous, mAttachedColorBuffer.Ptr(),
-                          mWidth, mHeight);
+                          "win=%p pbuffer=%p oldCb=%p newCb=%p size=%ux%u "
+                          "previousCompleted=%d restoredPrevious=%d",
+                          this, mSurface, previous.Ptr(),
+                          mAttachedColorBuffer.Ptr(), mWidth, mHeight,
+                          previousCompleted, restoredPrevious);
     }
 
-    // resize the window if the attached color buffer is of different
-    // size.
-    unsigned int cbWidth = mAttachedColorBuffer->getWidth();
-    unsigned int cbHeight = mAttachedColorBuffer->getHeight();
-
-    if (cbWidth != mWidth || cbHeight != mHeight) {
-        resize(cbWidth, cbHeight);
-    }
     mDiagnosticClearPending =
             aeGraphicsDiagEnabled("AE_DIAG_CLEAR_PBUFFER_ON_ATTACH");
     applyDiagnosticAttachClear();
@@ -308,6 +324,8 @@ bool WindowSurface::flushColorBuffer() {
     applyDiagnosticAttachClear();
 
     bool copied = mAttachedColorBuffer->blitFromCurrentReadBuffer();
+    // AndroidEmu previous-completed-frame restore v5
+    mAttachedColorBufferFlushed = copied;
 
     // restore current context/surface
     bool restored = s_egl.eglMakeCurrent(mDisplay, prevDrawSurf, prevReadSurf, prevContext);

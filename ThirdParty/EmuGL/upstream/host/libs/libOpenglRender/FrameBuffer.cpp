@@ -771,7 +771,8 @@ bool FrameBuffer::setWindowSurfaceColorBuffer(HandleType p_surface,
     // Keep the original Goldfish behavior by default. The old V3 restore can
     // still be enabled explicitly for A/B testing.
     if (aeGraphicsDiagEnabled("AE_DIAG_RESTORE_DEQUEUED_COLORBUFFER")) {
-        const bool restored = (*w).second->restoreColorBuffer();
+        const bool restored =
+                (*w).second->restoreColorBuffer((*c).second.cb);
         if (aeGraphicsDiagTraceEnabled()) {
             aeGraphicsDiagLog("FB_RESTORE_WINDOW_CB",
                               "surface=%#x colorbuffer=%#x restored=%d",

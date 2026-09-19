@@ -57,10 +57,11 @@ public:
     // Undrawn/preserved regions then become visually obvious.
     void applyDiagnosticAttachClear();
 
-    // AndroidEmu ColorBuffer -> PBuffer restore v3
-    // Restore the newly attached gralloc ColorBuffer into this window's host
-    // PBuffer before the guest performs a partial redraw.
-    bool restoreColorBuffer();
+    // AndroidEmu ColorBuffer -> PBuffer restore v3/v5.
+    // Draw an explicitly selected ColorBuffer into this window's PBuffer.
+    // V5 normally passes the immediately previous completed frame, not the
+    // newly dequeued BufferQueue slot.
+    bool restoreColorBuffer(ColorBufferPtr p_colorBuffer);
 
     // Copy the Pbuffer's pixels to the attached color buffer.
     // Returns true on success, or false on error (e.g. if there is no
@@ -100,6 +101,8 @@ private:
 private:
     EGLSurface mSurface;
     ColorBufferPtr mAttachedColorBuffer;
+    // AndroidEmu previous-completed-frame restore v5
+    bool mAttachedColorBufferFlushed;
     RenderContextPtr mReadContext;
     RenderContextPtr mDrawContext;
     GLuint mWidth;
