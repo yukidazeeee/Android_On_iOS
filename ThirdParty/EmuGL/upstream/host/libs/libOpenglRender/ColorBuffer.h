@@ -129,6 +129,12 @@ public:
     // Return true on success, false on failure (e.g. no current context).
     bool blitFromCurrentReadBuffer();
 
+    // AndroidEmu shared-context reverse GPU v6.
+    // The current context must be GLES2, current on the WindowSurface PBuffer,
+    // and in the helper share group that owns m_tex/m_blitTex/TextureDraw.
+    // This performs the reverse copy entirely on the GPU without EGLImage.
+    bool blitFromCurrentReadBufferSharedGPU();
+
     // Read the content of the whole ColorBuffer as 32-bit RGBA pixels.
     // |img| must be a buffer large enough (i.e. width * height * 4).
     bool readback(unsigned char* img);

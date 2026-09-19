@@ -323,12 +323,67 @@ bool WindowSurface::flushColorBuffer() {
     // Run the pending diagnostic poison now that this pbuffer is current.
     applyDiagnosticAttachClear();
 
-    bool copied = mAttachedColorBuffer->blitFromCurrentReadBuffer();
+    // AndroidEmu shared-context reverse GPU v6
+    //
+    // CPU remains a diagnostic/reference path. Normal GPU operation switches
+    // this same PBuffer to the dedicated ES2 context that shares ColorBuffer
+    // textures with FrameBuffer's helper group, avoiding reverse EGLImage
+    // aliasing entirely.
+    bool useCpuReverseBlit =
+            aeGraphicsDiagEnabled("AE_DIAG_CPU_REVERSE_BLIT");
+#ifdef AE_FORCE_CPU_COLORBUFFER_BLIT
+    useCpuReverseBlit = true;
+#endif
+    const bool useLegacyReverseEglImage =
+            aeGraphicsDiagEnabled("AE_DIAG_LEGACY_REVERSE_EGLIMAGE");
+
+    bool copied = false;
+    const char *reversePath = "legacy-eglimage";
+
+    if (!useCpuReverseBlit &&
+        !useLegacyReverseEglImage &&
+        mRestoreContext != EGL_NO_CONTEXT) {
+        reversePath = "shared-gpu";
+
+        // Finish the guest render pass before rebinding the same PBuffer to a
+        // different context. This also forces Metal to store its attachment.
+        if (mDrawContext->isGL2()) {
+            s_gles2.glFinish();
+        } else {
+            s_gles1.glFinish();
+        }
+
+        if (s_egl.eglMakeCurrent(
+                    mDisplay, mSurface, mSurface, mRestoreContext)) {
+            copied =
+                    mAttachedColorBuffer->blitFromCurrentReadBufferSharedGPU();
+        } else {
+            fprintf(stderr,
+                    "Renderer error: failed to bind shared reverse GPU context "
+                    "eglError=%#x\n",
+                    s_egl.eglGetError());
+        }
+    } else {
+        if (useCpuReverseBlit) {
+            reversePath = "cpu";
+        }
+        copied = mAttachedColorBuffer->blitFromCurrentReadBuffer();
+    }
+
+    if (sample) {
+        aeGraphicsDiagLog("WIN_REVERSE_PATH",
+                          "n=%llu win=%p cb=%p path=%s copied=%d",
+                          static_cast<unsigned long long>(ordinal),
+                          this, mAttachedColorBuffer.Ptr(),
+                          reversePath, copied);
+    }
+
     // AndroidEmu previous-completed-frame restore v5
     mAttachedColorBufferFlushed = copied;
 
     // restore current context/surface
-    bool restored = s_egl.eglMakeCurrent(mDisplay, prevDrawSurf, prevReadSurf, prevContext);
+    bool restored = s_egl.eglMakeCurrent(
+            mDisplay, prevDrawSurf, prevReadSurf, prevContext);
     if (sample) {
         aeGraphicsDiagLog("WIN_FLUSH_END",
                           "n=%llu copied=%d restored=%d cb=%p",

@@ -643,6 +643,120 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
     }
 }
 
+
+// AndroidEmu shared-context reverse GPU v6
+//
+// Reverse EGLImage is unnecessary when WindowSurface can temporarily make its
+// dedicated ES2 restore context current. That context already shares GL objects
+// with ColorBuffer's helper group, so copy the PBuffer directly into m_blitTex
+// and use the existing TextureDraw flip into m_tex.
+//
+// This deliberately uses a temporary FBO because framebuffer objects are
+// context-local even though the attached textures are shared.
+bool ColorBuffer::blitFromCurrentReadBufferSharedGPU()
+{
+    static std::atomic<uint64_t> sharedGpuOrdinal(0);
+    const uint64_t ordinal = sharedGpuOrdinal.fetch_add(1) + 1;
+    const bool sample =
+            aeGraphicsDiagTraceEnabled() && aeGraphicsDiagSample(ordinal);
+
+    if (!m_width || !m_height || !m_tex || !m_blitTex) {
+        if (sample) {
+            aeGraphicsDiagLog("REVERSE_SHARED_GPU_END",
+                              "n=%llu cb=%p ok=0 invalid-storage",
+                              static_cast<unsigned long long>(ordinal), this);
+        }
+        return false;
+    }
+
+    GLint previousFbo = 0;
+    GLint previousViewport[4] = {0, 0, 0, 0};
+    GLint previousActiveTexture = GL_TEXTURE0;
+    GLint previousTexture0 = 0;
+
+    s_gles2.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFbo);
+    s_gles2.glGetIntegerv(GL_VIEWPORT, previousViewport);
+    s_gles2.glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
+    s_gles2.glActiveTexture(GL_TEXTURE0);
+    s_gles2.glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture0);
+
+    if (sample) {
+        aeGraphicsDiagLog("REVERSE_SHARED_GPU_BEGIN",
+                          "n=%llu cb=%p size=%ux%u tex=%u blitTex=%u",
+                          static_cast<unsigned long long>(ordinal), this,
+                          m_width, m_height, m_tex, m_blitTex);
+    }
+
+    // Read from the WindowSurface PBuffer's default framebuffer.
+    s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    s_gles2.glBindTexture(GL_TEXTURE_2D, m_blitTex);
+
+    // Separate this operation's status from any earlier dedicated-context work.
+    s_gles2.glGetError();
+    s_gles2.glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                m_width, m_height);
+    const GLenum copyError = s_gles2.glGetError();
+
+    GLuint localFbo = 0;
+    GLenum framebufferStatus = 0;
+    bool drawn = false;
+    GLenum drawError = GL_NO_ERROR;
+
+    if (copyError == GL_NO_ERROR) {
+        s_gles2.glGenFramebuffers(1, &localFbo);
+        s_gles2.glBindFramebuffer(GL_FRAMEBUFFER, localFbo);
+        s_gles2.glFramebufferTexture2D(
+                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0_OES,
+                GL_TEXTURE_2D, m_tex, 0);
+        framebufferStatus = s_gles2.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+
+        if (framebufferStatus == GL_FRAMEBUFFER_COMPLETE_OES) {
+            s_gles2.glViewport(0, 0, m_width, m_height);
+            s_gles2.glDisable(GL_SCISSOR_TEST);
+            s_gles2.glDisable(GL_BLEND);
+            s_gles2.glDisable(GL_DEPTH_TEST);
+            s_gles2.glDisable(GL_STENCIL_TEST);
+            s_gles2.glDisable(GL_CULL_FACE);
+            s_gles2.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+            // TextureDraw uses vertically flipped texture coordinates, matching
+            // the established reverse EGLImage path and the known-good CPU path.
+            drawn = m_helper->getTextureDraw()->draw(m_blitTex, 0.0f);
+            s_gles2.glFinish();
+            drawError = s_gles2.glGetError();
+        }
+    }
+
+    // Restore only bindings/state needed by the dedicated shared context.
+    s_gles2.glBindFramebuffer(
+            GL_FRAMEBUFFER, static_cast<GLuint>(previousFbo));
+    if (localFbo) {
+        s_gles2.glDeleteFramebuffers(1, &localFbo);
+    }
+    s_gles2.glViewport(previousViewport[0], previousViewport[1],
+                       previousViewport[2], previousViewport[3]);
+    s_gles2.glActiveTexture(GL_TEXTURE0);
+    s_gles2.glBindTexture(
+            GL_TEXTURE_2D, static_cast<GLuint>(previousTexture0));
+    s_gles2.glActiveTexture(
+            static_cast<GLenum>(previousActiveTexture));
+
+    const bool ok =
+            copyError == GL_NO_ERROR &&
+            framebufferStatus == GL_FRAMEBUFFER_COMPLETE_OES &&
+            drawn &&
+            drawError == GL_NO_ERROR;
+
+    if (sample) {
+        aeGraphicsDiagLog("REVERSE_SHARED_GPU_END",
+                          "n=%llu cb=%p ok=%d copyError=%#x fboStatus=%#x "
+                          "drawn=%d drawError=%#x",
+                          static_cast<unsigned long long>(ordinal), this, ok,
+                          copyError, framebufferStatus, drawn, drawError);
+    }
+    return ok;
+}
+
 bool ColorBuffer::bindToTexture() {
     if (!m_eglImage) {
         return false;
