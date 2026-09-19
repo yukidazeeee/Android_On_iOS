@@ -759,17 +759,32 @@ bool FrameBuffer::setWindowSurfaceColorBuffer(HandleType p_surface,
     }
     (*w).second->setColorBuffer((*c).second.cb);
 
-    // Restore this particular BufferQueue slot's previous pixels before the
-    // guest starts its next partial redraw. Without this, one host PBuffer is
-    // reused across A/B/C ColorBuffers and untouched regions inherit pixels
-    // from the wrong slot (or the magenta diagnostic poison).
-    const bool restored = (*w).second->restoreColorBuffer();
+    // AndroidEmu: dequeued ColorBuffer restore is diagnostic-only.
+    //
+    // Goldfish keeps one persistent host PBuffer across BufferQueue slot
+    // changes. After swap/flush that PBuffer already contains the immediately
+    // previous completed frame. Restoring the newly dequeued A/B/C slot here
+    // can replace untouched regions with that slot's older contents and make
+    // partial redraws oscillate between stale frames.
+    //
+    // Keep the original Goldfish behavior by default. The old V3 restore can
+    // still be enabled explicitly for A/B testing.
+    if (aeGraphicsDiagEnabled("AE_DIAG_RESTORE_DEQUEUED_COLORBUFFER")) {
+        const bool restored = (*w).second->restoreColorBuffer();
+        if (aeGraphicsDiagTraceEnabled()) {
+            aeGraphicsDiagLog("FB_RESTORE_WINDOW_CB",
+                              "surface=%#x colorbuffer=%#x restored=%d",
+                              p_surface, p_colorbuffer, restored);
+        }
+        return restored;
+    }
+
     if (aeGraphicsDiagTraceEnabled()) {
         aeGraphicsDiagLog("FB_RESTORE_WINDOW_CB",
-                          "surface=%#x colorbuffer=%#x restored=%d",
-                          p_surface, p_colorbuffer, restored);
+                          "surface=%#x colorbuffer=%#x skipped=previous-frame-pbuffer",
+                          p_surface, p_colorbuffer);
     }
-    return restored;
+    return true;
 }
 
 void FrameBuffer::readColorBuffer(HandleType p_colorbuffer,
