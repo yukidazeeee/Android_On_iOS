@@ -24,14 +24,23 @@ cd build/ios-dependencies
 bash build-minimal.sh -p ios -a arm64 -q "$repo_dir/ThirdParty/checkouts/qemu"
 cd "$repo_dir"
 ios_prefix="$repo_dir/build/ios-dependencies/sysroot-iOS-arm64"
+gpu_cflags=""
+gpu_ldflags=""
+gpu_libraries=()
+if [[ "${ANDROIDEMU_GPU:-1}" == 1 ]]; then
+  bash scripts/build_gpu_ios.sh "$ios_prefix"
+  gpu_cflags="-DANDROID51_GPU_RENDERER=1"
+  gpu_ldflags="$repo_dir/build/gpu-ios/libandroidemu_gpu.a -lc++"
+  gpu_libraries=("$ios_prefix/lib/libEGL.dylib" "$ios_prefix/lib/libGLESv1_CM.dylib" "$ios_prefix/lib/libGLESv2.dylib")
+fi
 ios_sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
 ios_cc="$(xcrun --sdk iphoneos --find clang)"
 ios_cxx="$(xcrun --sdk iphoneos --find clang++)"
 export PKG_CONFIG="$ios_prefix/host/bin/pkg-config"
 export PKG_CONFIG_LIBDIR="$ios_prefix/lib/pkgconfig:$ios_prefix/share/pkgconfig"
 export PKG_CONFIG_PATH=""
-ios_flags="-target arm64-apple-ios17.0 -isysroot $ios_sdk_path -I$ios_prefix/include"
-ios_ldflags="-target arm64-apple-ios17.0 -isysroot $ios_sdk_path -L$ios_prefix/lib -Wl,-headerpad_max_install_names"
+ios_flags="-target arm64-apple-ios17.0 -isysroot $ios_sdk_path -I$ios_prefix/include $gpu_cflags"
+ios_ldflags="-target arm64-apple-ios17.0 -isysroot $ios_sdk_path -L$ios_prefix/lib -Wl,-headerpad_max_install_names $gpu_ldflags"
 mkdir -p build/qemu-ios
 cd build/qemu-ios
 "$repo_dir/ThirdParty/checkouts/qemu/configure" --prefix="$ios_prefix" \
@@ -47,4 +56,4 @@ cd build/qemu-ios
   --disable-gcrypt --disable-curl --disable-libssh --disable-libnfs --disable-libusb --disable-usb-redir
 ninja -j "${QEMU_BUILD_JOBS:-2}" libqemu-arm-softmmu.dylib
 cd "$repo_dir"
-python3 scripts/package_engine_frameworks.py build/qemu-ios/libqemu-arm-softmmu.dylib "$ios_prefix" build/ios-frameworks
+python3 scripts/package_engine_frameworks.py build/qemu-ios/libqemu-arm-softmmu.dylib "$ios_prefix" build/ios-frameworks "${gpu_libraries[@]}"

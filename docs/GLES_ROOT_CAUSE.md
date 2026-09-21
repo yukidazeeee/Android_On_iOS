@@ -1,6 +1,26 @@
 # Android 6 Browser / WebViewのGPUクラッシュ調査
 
-現状: 原因の経路は特定済み。GLES 2対応レンダラーは未実装で、Browser / WebViewの正常起動・描画はまだ確認できていない。
+現状: EmuGL GLES1/2 decoder、Goldfish GPU pipe、ANGLE/Metal の iOS ビルド・同梱経路を追加済み。Linux の実 EGL/GLES による描画試験は通過。ただし iOS および Android 4/5/6 実イメージ上での Browser / WebView の正常動作は未確認であり、完全対応とはしていない。
+
+## 今回の実装と起動時の扱い
+
+- `GPU/` は分割パケット、同期応答、GLES1/2 と renderControl を処理し、実 EGL context / pbuffer / color buffer に接続する。
+- GPU の初期化に成功した場合だけ、カーネル引数と boot-properties の両方で `qemu.gles=1` を通知する。
+- libEGL / libGLESv1_CM / libGLESv2 が欠ける、古いエンジンに GPU API がない、初期化に失敗する場合は、理由をログに残して `qemu.gles=0` の CPU framebuffer で起動する。ライブラリ欠落だけを理由に VM 起動を中止しない。このフォールバックは GLES2 WebView の修正にはならない。
+- `scripts/build_qemu_ios.sh` は既定で `build_gpu_ios.sh` を実行し、固定 revision の ANGLE iOS frameworks をエンジンと一緒に同梱する。macOS / Xcode が必要。`ANDROIDEMU_GPU=0` は従来のソフトウェア構成を明示的に選ぶ。
+- GLES1/2 clear/readback、GLES2 shader compile/link と FBO clear/readback、color buffer update/post、接続の終了処理を `Tests/GpuRendererTests.cpp` で検証する。GLES1 を無効化した Mesa では実行できない。
+
+検証例（GLES1/2 有効の Mesa を指定）:
+
+```sh
+cmake -S GPU -B build/gpu -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/gpu --parallel 2
+LD_LIBRARY_PATH=/path/to/mesa/lib ctest --test-dir build/gpu --output-on-failure
+```
+
+未検証事項: iOS SDK によるビルド・コード署名・Metal 実行、Android API ごとの wire protocol / 拡張機能の互換性、Browser / WebView、EGLImage 共有と複数アプリの寿命管理。旧 EmuGL の全拡張を完全実装したという意味ではない。
+
+以下は変更前の原因調査記録。
 
 ## 現在の実装とログの対応
 

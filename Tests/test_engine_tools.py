@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import plistlib
 import tempfile
@@ -53,6 +54,33 @@ class EnginePackagingTests(unittest.TestCase):
         info = plistlib.loads((self.destination / 'libglib_2_0_0.framework/Info.plist').read_bytes())
         self.assertNotIn('_', info['CFBundleIdentifier'])
         self.assertTrue(any('-change' in call.args[0] and '@rpath/libglib_2_0_0.framework/libglib_2_0_0' in call.args[0] for call in calls))
+
+    def test_dynamically_loaded_gpu_libraries_are_packaged(self):
+        libraries = []
+        for name in ('libEGL', 'libGLESv1_CM', 'libGLESv2'):
+            library = self.prefix / 'lib' / (name + '.dylib')
+            library.write_bytes(name.encode())
+            libraries.append(library)
+        with patch.object(package, 'run', self.tool), patch.object(package.subprocess, 'run'):
+            package.package(self.engine, self.prefix, self.destination, libraries)
+        manifest = json.loads((self.destination / 'engine-manifest.json').read_text())
+        for name in ('libEGL', 'libGLESv1_CM', 'libGLESv2'):
+            self.assertIn(name, manifest['frameworks'])
+            self.assertEqual((self.destination / (name + '.framework') / name).read_bytes(), name.encode())
+
+    def test_angle_framework_dependency_is_found_in_staged_ios_libraries(self):
+        egl = self.prefix / 'lib/libEGL.dylib'
+        gles = self.prefix / 'lib/libGLESv2.dylib'
+        egl.write_bytes(b'EGL')
+        gles.write_bytes(b'GLES')
+        inspect = self.tool
+        def angle_tools(*args):
+            if args[:2] == ('otool', '-L') and Path(args[2]) == egl:
+                return f'{egl}:\n  @rpath/libEGL.framework/libEGL (compatibility version 1.0.0)\n  @rpath/libGLESv2.framework/libGLESv2 (compatibility version 1.0.0)\n'
+            return inspect(*args)
+        with patch.object(package, 'run', angle_tools), patch.object(package.subprocess, 'run'):
+            package.package(self.engine, self.prefix, self.destination, [egl])
+        self.assertEqual((self.destination / 'libGLESv2.framework/libGLESv2').read_bytes(), b'GLES')
 
     def test_rejects_macos_binaries(self):
         self.platform = 'MACOS'

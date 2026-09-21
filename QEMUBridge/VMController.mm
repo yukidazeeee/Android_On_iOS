@@ -6,6 +6,7 @@
 #import "Performance/RuntimeMetrics.h"
 #include "ThirdParty/AndroidQemuCompat/qemu/android51_host.h"
 #include "ThirdParty/AndroidQemuCompat/qemu/gpu.h"
+#include "GPUStartup.hpp"
 #include "Network/GuestNetwork.hpp"
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -194,8 +195,9 @@ static std::string optionPath(NSString *path) {
     _stop = reinterpret_cast<decltype(_stop)>(resolve("android51_host_stop"));
     _metric = reinterpret_cast<decltype(_metric)>(resolve("android51_host_metric"));
     _region = reinterpret_cast<decltype(_region)>(resolve("android51_tcg_set_region"));
-    _gpuStart = reinterpret_cast<decltype(_gpuStart)>(resolve("android51_gpu_start"));
-    _gpuStop = reinterpret_cast<decltype(_gpuStop)>(resolve("android51_gpu_stop"));
+    // GPU entry points are optional for compatibility with framebuffer-only engines.
+    _gpuStart = reinterpret_cast<decltype(_gpuStart)>(dlsym(_library, "android51_gpu_start"));
+    _gpuStop = reinterpret_cast<decltype(_gpuStop)>(dlsym(_library, "android51_gpu_stop"));
     for (const char *name : {"android51_adb_connected", "android51_adb_disconnect",
                             "android51_adb_read", "android51_adb_write"}) {
         resolve(name);
@@ -212,8 +214,10 @@ static std::string optionPath(NSString *path) {
             stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.framework/%@", name, name]];
         if (!_angleLibraries[index]) _angleLibraries[index] = dlopen(binary.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
         if (!_angleLibraries[index]) {
-            _statusText = [NSString stringWithFormat:@"描画ライブラリ %@ を読み込めません。GPU対応のIPAを再ビルドしてください。", name];
-            return NO;
+            const char *reason = dlerror();
+            NSString *diagnostic = [NSString stringWithFormat:@"[GPU] %@: %s\n", binary, reason ?: "not available"];
+            NSData *bytes = [diagnostic dataUsingEncoding:NSUTF8StringEncoding];
+            [self hostSerial:static_cast<const uint8_t *>(bytes.bytes) length:bytes.length];
         }
     }
     NSError *error = nil;
@@ -227,7 +231,7 @@ static std::string optionPath(NSString *path) {
         "-audiodev", "none,id=audio", "-nic", emu::guestNICOption(),
         "-kernel", [path stringByAppendingPathComponent:@"kernel"].UTF8String,
         "-initrd", [path stringByAppendingPathComponent:@"ramdisk.img"].UTF8String,
-        "-append", "qemu=1 console=ttyS0 androidboot.console=ttyS0 androidboot.hardware=goldfish qemu.gles=1 android.qemud=1"};
+        "-append", emu::guestKernelArguments(false)};
     for (NSString *name in disks) {
         args.emplace_back("-drive");
         args.push_back("if=none,id=" + std::string(name.UTF8String) + ",format=raw,file=" +
@@ -241,23 +245,31 @@ static std::string optionPath(NSString *path) {
         @autoreleasepool {
             // Block retains controller and its views until every QEMU callback stops.
             std::vector<std::string> owned = args;
+            char gpuError[512] = "ANGLE libraries or engine GPU entry points are unavailable";
+            bool gpuReady = emu::initializeGuestGPU(self->_gpuStart, self->_gpuStop,
+                self->_angleLibraries, self->_width, self->_height, gpuResolve,
+                gpuPostCallback, (__bridge void *)self, gpuError, sizeof(gpuError));
+            for (size_t index = 0; index + 1 < owned.size(); ++index) {
+                if (owned[index] == "-append") { owned[index+1] = emu::guestKernelArguments(gpuReady); break; }
+            }
+            if (!gpuReady) {
+                NSString *diagnostic = [NSString stringWithFormat:@"[GPU] %s\n[GPU] Software framebuffer fallback; GLES2/WebView acceleration unavailable.\n", gpuError];
+                NSData *bytes = [diagnostic dataUsingEncoding:NSUTF8StringEncoding];
+                [self hostSerial:static_cast<const uint8_t *>(bytes.bytes) length:bytes.length];
+            }
             std::vector<char *> argv;
             for (auto &arg : owned) argv.push_back(arg.data());
             argv.push_back(nullptr);
             Android51Host host = {ANDROID51_HOST_ABI, sizeof(Android51Host), (__bridge void *)self,
                 frameCallback, inputCallback, pcmCallback, serialCallback, stateCallback};
-            char gpuError[512] = {};
-            bool gpuReady = self->_gpuStart(self->_width, self->_height, true, gpuResolve,
-                self->_angleLibraries, gpuPostCallback, (__bridge void *)self, gpuError, sizeof(gpuError));
-            int result = gpuReady ? self->_run((int)owned.size(), argv.data(), &host) : -1;
+            int result = self->_run((int)owned.size(), argv.data(), &host);
             if (gpuReady) self->_gpuStop();
-            NSString *gpuFailure = gpuReady ? nil : [NSString stringWithFormat:@"GPU初期化失敗: %s", gpuError];
             dispatch_async(dispatch_get_main_queue(), ^{
                 self->_worker = nil;
                 [self->_adb cancel];
                 self->_stopped = YES; self->_display.paused = YES; self->_input.userInteractionEnabled = NO; [self->_audio stop];
                 [UIApplication sharedApplication].idleTimerDisabled = NO;
-                self->_statusText = gpuFailure ?: (result == 0 ? @"停止しました。再起動にはアプリを開き直してください" : @"QEMUがエラーで停止しました");
+                self->_statusText = result == 0 ? @"停止しました。再起動にはアプリを開き直してください" : @"QEMUがエラーで停止しました";
             });
         }
     }];

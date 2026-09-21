@@ -56,6 +56,57 @@ static uint32_t choose_config(Android51GpuStream *stream, unsigned version) {
     assert(reply_word(stream) == 1);
     return config;
 }
+static uint32_t compile_shader(Android51GpuStream *stream, uint32_t type, const char *text) {
+    send_packet(stream, 2074, {type});
+    uint32_t shader = reply_word(stream);
+    assert(shader);
+    size_t bytes = std::strlen(text) + 1;
+    size_t padded = (bytes + 3) & ~size_t(3);
+    std::vector<uint32_t> words{shader, uint32_t(padded)};
+    words.resize(2 + padded / 4, 0);
+    std::memcpy(words.data() + 2, text, bytes);
+    words.push_back(uint32_t(bytes));
+    send_packet(stream, 2254, words);
+    send_packet(stream, 2068, {shader});
+    send_packet(stream, 2115, {shader,0x8b81,4});
+    assert(reply_word(stream) == 1);
+    return shader;
+}
+static void shader_and_fbo(Android51GpuStream *stream) {
+    uint32_t vertex = compile_shader(stream, 0x8b31,
+        "attribute vec4 position; void main(){gl_Position=position;}");
+    uint32_t fragment = compile_shader(stream, 0x8b30,
+        "precision mediump float; void main(){gl_FragColor=vec4(0.,1.,0.,1.);}");
+    send_packet(stream, 2073, {});
+    uint32_t program = reply_word(stream);
+    assert(program);
+    send_packet(stream, 2049, {program,vertex});
+    send_packet(stream, 2049, {program,fragment});
+    send_packet(stream, 2137, {program});
+    send_packet(stream, 2112, {program,0x8b82,4});
+    assert(reply_word(stream) == 1);
+    send_packet(stream, 2178, {program});
+
+    send_packet(stream, 2101, {1,4});
+    uint32_t texture = reply_word(stream);
+    assert(texture);
+    send_packet(stream, 2054, {0x0de1,texture});
+    send_packet(stream, 2153, {0x0de1,0,0x1908,2,2,0,0x1908,0x1401,0});
+    send_packet(stream, 2099, {1,4});
+    uint32_t fbo = reply_word(stream);
+    assert(fbo);
+    send_packet(stream, 2052, {0x8d40,fbo});
+    send_packet(stream, 2095, {0x8d40,0x8ce0,0x0de1,texture,0});
+    send_packet(stream, 2062, {0x8d40});
+    assert(reply_word(stream) == 0x8cd5); // Actual GL_FRAMEBUFFER_COMPLETE.
+    send_packet(stream, 2064, {0,0x3f800000,0,0x3f800000});
+    send_packet(stream, 2063, {0x4000});
+    send_packet(stream, 2140, {0,0,1,1,0x1908,0x1401,4});
+    assert(reply_word(stream) == 0xff00ff00);
+    send_packet(stream, 2108, {});
+    assert(reply_word(stream) == 0);
+    send_packet(stream, 2052, {0x8d40,0});
+}
 static void draw_context(Android51GpuStream *stream, unsigned version) {
     uint32_t config = choose_config(stream, version);
     send_packet(stream, 10008, {config, 0, version});
@@ -73,6 +124,7 @@ static void draw_context(Android51GpuStream *stream, unsigned version) {
     std::array<unsigned char,4> pixel{};
     exact_read(stream, pixel.data(), pixel.size());
     assert((pixel == std::array<unsigned char,4>{255,0,0,255}));
+    if (version == 2) shader_and_fbo(stream);
     send_packet(stream, 10017, {0,0,0});
     assert(reply_word(stream) == 1);
     send_packet(stream, 10011, {surface});

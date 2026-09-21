@@ -28,7 +28,7 @@ def verify_engine_exports(path):
 def run(*args):
     return subprocess.check_output(args, text=True)
 
-def package(engine, prefix, destination):
+def package(engine, prefix, destination, runtime_libraries=()):
     engine, prefix, destination = (Path(p).resolve() for p in (engine, prefix, destination))
     closure, imports = {}, {}
     def visit(path, main=False):
@@ -58,6 +58,8 @@ def package(engine, prefix, destination):
                 continue
             if dep.startswith('@rpath/') or dep.startswith('@loader_path/'):
                 target = prefix / 'lib' / Path(dep).name
+                if '.framework/' in dep:
+                    target = target.with_name(target.name + '.dylib')
             else:
                 target = Path(dep)
             target = target.resolve(strict=True)
@@ -65,6 +67,10 @@ def package(engine, prefix, destination):
             visit(target)
         imports[path] = deps
     visit(engine, True)
+    # dlopen dependencies are absent from the engine's Mach-O load commands.
+    # They still need platform checks, dependency relocation and IPA embedding.
+    for library in runtime_libraries:
+        visit(Path(library))
     destination.mkdir(parents=True, exist_ok=True)
     # Only replace framework names owned by this generated closure.
     for path, name in closure.items():
@@ -89,4 +95,4 @@ def package(engine, prefix, destination):
     (destination / 'engine-manifest.json').write_text(json.dumps({'frameworks': sorted(closure.values())}, indent=2) + '\n')
 
 if __name__ == '__main__':
-    package(*sys.argv[1:])
+    package(*sys.argv[1:4], runtime_libraries=sys.argv[4:])

@@ -38,6 +38,12 @@ def prepare(destination):
     config = destination / 'configs/devices/arm-softmmu/default.mak'
     if config.read_text() != 'CONFIG_ANDROID51=y\n':
         config.write_text('CONFIG_ANDROID51=y\n')
+    # Migrate the early GPU export patch, which overlapped patch 0005 and made
+    # repeated preparation fail. Keep each patch's reverse-check independent.
+    symbols = destination / 'system/qemu.symbols'
+    early_gpu_exports = '{\n  android51_gpu_start;\n  android51_gpu_stop;\n  android51_gpu_ready;\n'
+    if symbols.read_text().startswith(early_gpu_exports):
+        symbols.write_text(symbols.read_text().replace(early_gpu_exports, '{\n', 1))
     for patch in sorted((ROOT / 'ThirdParty/AndroidQemuCompat/patches').glob('*.patch')):
         # git apply is also usable on tar-extracted sources, but the revision check
         # above intentionally requires an auditable Git checkout.

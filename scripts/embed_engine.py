@@ -27,6 +27,16 @@ def embed(app):
     notices.mkdir(exist_ok=True)
     for name in ['LICENSE', 'TCG-MIT.txt', 'LGPL-2.1.txt']:
         shutil.copy2(ROOT / 'ThirdParty/AndroidQemuCompat' / name, notices / name)
+    shutil.copy2(ROOT / 'ThirdParty/EmuGL/LICENSE', notices / 'EmuGL-Apache-2.0.txt')
+    if 'libEGL' in names:
+        angle = ROOT / 'ThirdParty/checkouts/angle'
+        if not (angle / 'LICENSE').is_file():
+            raise FileNotFoundError('ANGLE license sources missing')
+        for path in angle.rglob('*'):
+            if path.is_file() and not path.is_symlink() and not {'.git', 'out'}.intersection(path.relative_to(angle).parts) and path.name.upper().startswith(('COPYING', 'LICENSE', 'LICENCE')):
+                output = notices / 'ANGLE' / path.relative_to(angle)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, output)
     # Include all installed dependency license texts and exact input revisions.
     shutil.copy2(ROOT / 'ThirdParty/dependencies.lock.json', notices)
     shutil.copy2(source / 'engine-manifest.json', notices)
