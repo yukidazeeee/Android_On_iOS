@@ -1,0 +1,15 @@
+From: AndroidEmu contributors
+Subject: [PATCH] system: export optional embedded GPU initialization
+
+SPDX-License-Identifier: GPL-2.0-or-later
+
+--- a/system/qemu.symbols
++++ b/system/qemu.symbols
+@@ -1,4 +1,7 @@
+ {
++  android51_gpu_start;
++  android51_gpu_stop;
++  android51_gpu_ready;
+   android51_host_run;
+   android51_host_pause;
+   android51_host_stop;

@@ -3,6 +3,10 @@
 #include "android51.h"
 #include "android51_host.h"
 #include "adb.h"
+#include "gpu.h"
+#ifdef ANDROID51_GPU_RENDERER
+#include "gpu_renderer.h"
+#endif
 #include "tcg/tcg.h"
 #include "system/tcg.h"
 #include "accel/tcg/tb-context.h"
@@ -23,6 +27,30 @@ uint64_t android51_host_metric(unsigned index) { return index < 3 ? qatomic_read
 static QEMUTimer *poll_timer;
 static Android51Event pending[128];
 static size_t pending_index, pending_count;
+
+bool android51_gpu_start(uint32_t width, uint32_t height, bool metal,
+    void *(*resolve)(void *, unsigned, const char *), void *resolve_context,
+    void (*post)(void *, const uint8_t *, uint32_t, uint32_t), void *post_context,
+    char *error, size_t error_capacity)
+{
+#ifdef ANDROID51_GPU_RENDERER
+    return ae_gpu_renderer_initialize(width, height, metal, resolve, resolve_context,
+                                     post, post_context, error, error_capacity);
+#else
+    if (error && error_capacity) {
+        snprintf(error, error_capacity, "This engine was built without the GLES renderer");
+    }
+    return false;
+#endif
+}
+bool android51_gpu_stop(void)
+{
+#ifdef ANDROID51_GPU_RENDERER
+    return ae_gpu_renderer_shutdown();
+#else
+    return android51_gpu_configure(NULL);
+#endif
+}
 
 void android51_host_frame(const uint8_t *pixels, size_t stride, uint32_t x,
                           uint32_t y, uint32_t width, uint32_t height)
@@ -83,6 +111,7 @@ int android51_host_run(int argc, char **argv, const Android51Host *host)
     timer_free(poll_timer);
     gf_adb_connect(false);
     vm_stop(RUN_STATE_SHUTDOWN);
+    gf_gpu_pipes_close();
     if (bdrv_flush_all() < 0) { result = -1; }
     qemu_cleanup(result);
     bql_unlock();

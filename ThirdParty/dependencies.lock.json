@@ -41,6 +41,22 @@
         "INTEGRATION.md universal app-side entry points",
         "Sources/ProcessInfo+TXM.swift detection approach"
       ]
+    },
+    {
+      "name": "angle",
+      "url": "https://chromium.googlesource.com/angle/angle",
+      "commit": "9d4f4abe5c5caa6e9fa39a4d93eef378e3303a43",
+      "license": "BSD-3-Clause and per-file dependencies",
+      "linked": true,
+      "integration": "EGL/GLES1/GLES2 Metal backend; iOS runtime validation required"
+    },
+    {
+      "name": "depot_tools",
+      "url": "https://chromium.googlesource.com/chromium/tools/depot_tools",
+      "commit": "921e61b35fbc5e97b14250a118e363ec05078089",
+      "license": "BSD-3-Clause and per-file dependencies",
+      "linked": false,
+      "integration": "Pinned ANGLE dependency and GN build tooling"
     }
   ]
 }

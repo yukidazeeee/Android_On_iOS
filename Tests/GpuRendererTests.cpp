@@ -1,0 +1,134 @@
+#include "GPU/Renderer.h"
+#include "ThirdParty/AndroidQemuCompat/qemu/gpu.h"
+#include <cassert>
+#include <cstdio>
+#include <cstring>
+#include <dlfcn.h>
+#include <array>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <mutex>
+
+struct Libraries { void *egl, *gles1, *gles2; };
+static void *resolve(void *opaque, unsigned api, const char *name) {
+    auto *libs = static_cast<Libraries *>(opaque);
+    void *library = api == 0 ? libs->egl : api == 1 ? libs->gles1 : libs->gles2;
+    void *result = dlsym(library, name);
+    if (!result) {
+        auto proc = reinterpret_cast<void *(*)(const char *)>(dlsym(libs->egl, "eglGetProcAddress"));
+        if (proc) result = proc(name);
+    }
+    return result;
+}
+static void exact_read(Android51GpuStream *stream, void *data, size_t size) {
+    auto *cursor = static_cast<unsigned char *>(data);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (size) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        int count = android51_gpu_receive(stream, cursor, size);
+        assert(count > 0 || count == -2);
+        if (count > 0) { cursor += count; size -= count; }
+        else std::this_thread::yield();
+    }
+}
+static void send_packet(Android51GpuStream *stream, uint32_t opcode, std::vector<uint32_t> words) {
+    words.insert(words.begin(), {opcode, uint32_t(8 + words.size() * 4)});
+    const auto *bytes = reinterpret_cast<const unsigned char *>(words.data());
+    size_t remaining = words.size() * 4;
+    while (remaining) {
+        int count = android51_gpu_send(stream, bytes, remaining);
+        assert(count > 0 || count == -2);
+        if (count > 0) { bytes += count; remaining -= count; }
+        else std::this_thread::yield();
+    }
+}
+static uint32_t reply_word(Android51GpuStream *stream) {
+    uint32_t word;
+    exact_read(stream, &word, sizeof(word));
+    return word;
+}
+static uint32_t choose_config(Android51GpuStream *stream, unsigned version) {
+    // EGL RGB8, pbuffer, ES1/ES2. Literal wire layout from renderControl.in.
+    send_packet(stream, 10006, {44, 0x3024,8, 0x3023,8, 0x3022,8,
+        0x3033,1, 0x3040,version == 1 ? 1u : 4u, 0x3038, 44, 4, 1});
+    uint32_t config = reply_word(stream);
+    assert(reply_word(stream) == 1);
+    return config;
+}
+static void draw_context(Android51GpuStream *stream, unsigned version) {
+    uint32_t config = choose_config(stream, version);
+    send_packet(stream, 10008, {config, 0, version});
+    uint32_t context = reply_word(stream);
+    assert(context);
+    send_packet(stream, 10010, {config,16,16});
+    uint32_t surface = reply_word(stream);
+    assert(surface);
+    send_packet(stream, 10017, {context,surface,surface});
+    assert(reply_word(stream) == 1);
+    // IEEE754 1.0f, 0.0f, 0.0f, 1.0f; clear and read actual pixels.
+    send_packet(stream, version == 1 ? 1025 : 2064, {0x3f800000,0,0,0x3f800000});
+    send_packet(stream, version == 1 ? 1069 : 2063, {0x4000});
+    send_packet(stream, version == 1 ? 1143 : 2140, {0,0,1,1,0x1908,0x1401,4});
+    std::array<unsigned char,4> pixel{};
+    exact_read(stream, pixel.data(), pixel.size());
+    assert((pixel == std::array<unsigned char,4>{255,0,0,255}));
+    send_packet(stream, 10017, {0,0,0});
+    assert(reply_word(stream) == 1);
+    send_packet(stream, 10011, {surface});
+    send_packet(stream, 10009, {context});
+}
+
+static std::mutex frame_mutex;
+static std::vector<unsigned char> last_frame;
+static void posted(void *, const uint8_t *pixels, uint32_t width, uint32_t height) {
+    assert(width == 16 && height == 16);
+    std::lock_guard<std::mutex> lock(frame_mutex);
+    last_frame.assign(pixels, pixels + width * height * 4);
+}
+static void colorbuffer(Android51GpuStream *stream) {
+    send_packet(stream, 10012, {16,16,0x1908});
+    uint32_t color = reply_word(stream);
+    assert(color);
+    std::vector<uint32_t> data{color,0,0,16,16,0x1908,0x1401,1024};
+    data.insert(data.end(), 256, 0xff00ff00); // RGBA green.
+    send_packet(stream, 10024, data);
+    assert(reply_word(stream) == 0);
+    send_packet(stream, 10018, {color});
+    send_packet(stream, 10000, {}); // Ordered round-trip after post.
+    assert(reply_word(stream) == 1);
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex);
+        assert(last_frame.size() == 1024);
+        for (size_t i = 0; i < last_frame.size(); i += 4) {
+            assert(last_frame[i] == 0 && last_frame[i+1] == 255 &&
+                last_frame[i+2] == 0 && last_frame[i+3] == 255);
+        }
+    }
+    send_packet(stream, 10014, {color});
+}
+int main() {
+    Libraries libs{dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL),
+        dlopen("libGLESv1_CM.so.1", RTLD_NOW | RTLD_LOCAL),
+        dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_LOCAL)};
+    assert(libs.egl && libs.gles1 && libs.gles2);
+    char error[512]{};
+    if (!ae_gpu_renderer_initialize(16, 16, false, resolve, &libs, posted, nullptr, error, sizeof(error))) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+    auto *stream = android51_gpu_open();
+    assert(stream);
+    // Zero client flags, rcGetRendererVersion opcode 10000, packet length 8.
+    const unsigned char bytes[] = {0,0,0,0, 0x10,0x27,0,0, 8,0,0,0};
+    for (unsigned char byte : bytes) assert(android51_gpu_send(stream, &byte, 1) == 1);
+    std::array<unsigned char,4> reply{};
+    exact_read(stream, reply.data(), reply.size());
+    assert((reply == std::array<unsigned char,4>{1,0,0,0}));
+    draw_context(stream, 1);
+    draw_context(stream, 2);
+    colorbuffer(stream);
+    assert(!ae_gpu_renderer_shutdown());
+    android51_gpu_close(stream);
+    assert(ae_gpu_renderer_shutdown());
+}

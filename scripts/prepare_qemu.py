@@ -15,6 +15,7 @@ def prepare(destination):
         raise ValueError(f'Expected UTM QEMU {COMMIT}, got {revision}')
     overlay = destination / 'hw/arm/android51'
     overlay.mkdir(exist_ok=True)
+    shutil.copyfile(ROOT / 'GPU/Renderer.h', overlay / 'gpu_renderer.h')
     for source in (ROOT / 'ThirdParty/AndroidQemuCompat/qemu').glob('*'):
         if source.suffix in ('.h', '.c', '.inc'):
             target = overlay / source.name
@@ -22,7 +23,7 @@ def prepare(destination):
                 shutil.copyfile(source, target)
     additions = {
         'hw/arm/Kconfig': '\nconfig ANDROID51\n    bool\n    default y\n    depends on TCG && ARM\n    select SMC91C111\n',
-        'hw/arm/meson.build': "\narm_ss.add(when: 'CONFIG_ANDROID51', if_true: files(\n  'android51/android51.c', 'android51/platform.c', 'android51/nand.c',\n  'android51/display.c', 'android51/events.c', 'android51/battery.c',\n  'android51/pipe.c', 'android51/audio.c', 'android51/host.c', 'android51/adb.c'))\n",
+        'hw/arm/meson.build': "\narm_ss.add(when: 'CONFIG_ANDROID51', if_true: files(\n  'android51/android51.c', 'android51/platform.c', 'android51/nand.c',\n  'android51/display.c', 'android51/events.c', 'android51/battery.c',\n  'android51/pipe.c', 'android51/audio.c', 'android51/host.c', 'android51/adb.c', 'android51/gpu.c'))\n",
     }
     for name, addition in additions.items():
         path = destination / name

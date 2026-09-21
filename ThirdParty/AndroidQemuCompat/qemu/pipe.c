@@ -16,13 +16,14 @@
 #include "qemu/osdep.h"
 #include "android51.h"
 #include "adb.h"
+#include "gpu.h"
 #include "gsm.h"
 #include "system/reset.h"
 #include "qemu/bswap.h"
 
 #define GF_PIPE_LIMIT 64
 #define GF_PIPE_BYTES 8192
-typedef enum GFService { GF_CONNECT, GF_BOOT_PROPERTIES, GF_PINGPONG, GF_GSM, GF_ADB_ACCEPT, GF_ADB_START, GF_ADB_DATA, GF_CLOSED } GFService;
+typedef enum GFService { GF_CONNECT, GF_BOOT_PROPERTIES, GF_PINGPONG, GF_GSM, GF_ADB_ACCEPT, GF_ADB_START, GF_ADB_DATA, GF_GPU, GF_CLOSED } GFService;
 typedef struct GFPipe {
     bool used;
     uint32_t channel, wanted, wakes;
@@ -30,6 +31,7 @@ typedef struct GFPipe {
     uint8_t incoming[GF_PIPE_BYTES], outgoing[GF_PIPE_BYTES];
     unsigned received, queued;
     GFGSM gsm;
+    Android51GpuStream *gpu;
 } GFPipe;
 typedef struct GFPipes {
     Android51State *board;
@@ -41,9 +43,23 @@ typedef struct GFPipes {
     QEMUTimer *adb_timer;
     GFPipe *adb;
 } GFPipes;
+static GFPipes *active_pipes;
+void gf_gpu_pipes_close(void)
+{
+    if (!active_pipes) { return; }
+    for (unsigned i = 0; i < GF_PIPE_LIMIT; ++i) {
+        GFPipe *p = &active_pipes->pipes[i];
+        if (p->gpu) {
+            android51_gpu_close(p->gpu);
+            p->gpu = NULL;
+            p->service = GF_CLOSED;
+        }
+    }
+}
 static bool pipe_writable(GFPipe *p)
 {
     if (p->service == GF_CLOSED) { return false; }
+    if (p->service == GF_GPU) { return (android51_gpu_poll(p->gpu) & 2) != 0; }
     if (p->service == GF_ADB_DATA) { return gf_adb_guest_writable() != 0; }
     if (p->service == GF_GSM) { return GF_PIPE_BYTES - p->queued >= 1024; }
     return p->queued < GF_PIPE_BYTES;
@@ -58,6 +74,10 @@ static void pipe_wake(GFPipes *s, GFPipe *p)
 {
     uint32_t ready = (p->queued ? 2 : 0) | (pipe_writable(p) ? 4 : 0);
     if (p->service == GF_CLOSED) { ready |= 1; }
+    if (p->service == GF_GPU) {
+        unsigned gpu = android51_gpu_poll(p->gpu);
+        ready |= (gpu & 1 ? 2 : 0) | (gpu & 4 ? 1 : 0);
+    }
     p->wakes |= (ready & p->wanted) | (ready & 1);
     p->wanted &= ~p->wakes;
     pipes_irq(s);
@@ -83,7 +103,6 @@ static bool boot_properties(GFPipes *s, GFPipe *p)
 {
     static const char *properties[] = {
         "qemu.sf.lcd_density=160", "qemu.hw.mainkeys=0", "qemu.sf.fake_camera=none",
-        "qemu.gles=0",
     };
     while (p->received >= 4) {
         unsigned length = 0;
@@ -100,6 +119,8 @@ static bool boot_properties(GFPipes *s, GFPipe *p)
         for (unsigned i = 0; i < ARRAY_SIZE(properties); ++i) {
             if (!framed_reply(p, properties[i], strlen(properties[i]))) { return false; }
         }
+        const char *gles = android51_gpu_ready() ? "qemu.gles=1" : "qemu.gles=0";
+        if (!framed_reply(p, gles, strlen(gles))) { return false; }
         char dimension[64];
         snprintf(dimension, sizeof(dimension), "qemu.sf.lcd_width=%u", s->board->width);
         if (!framed_reply(p, dimension, strlen(dimension))) { return false; }
@@ -129,11 +150,17 @@ static int32_t pipe_send(GFPipes *s, GFPipe *p)
                     p->service = GF_ADB_ACCEPT; s->adb = p;
                 }
                 else if (!strcmp((char *)p->incoming, "pipe:pingpong")) { p->service = GF_PINGPONG; }
+                else if (!strcmp((char *)p->incoming, "pipe:opengles") &&
+                         (p->gpu = android51_gpu_open())) { p->service = GF_GPU; }
                 else { p->service = GF_CLOSED; return -1; }
                 p->received = 0;
                 break;
             }
         }
+    }
+    if (p->service == GF_GPU) {
+        int sent = android51_gpu_send(p->gpu, buffer + offset, s->length - offset);
+        return sent >= 0 ? (int32_t)offset + sent : offset ? (int32_t)offset : sent;
     }
     if (p->service == GF_GSM) {
         while (offset < s->length) {
@@ -202,10 +229,12 @@ static void pipe_command(GFPipes *s, uint32_t command)
         s->result = -3; return;
     }
     if (!p) { return; }
-    if (command == 2) { if (s->adb == p) { gf_adb_connect(false); s->adb = NULL; } memset(p, 0, sizeof(*p)); s->result = 0; pipes_irq(s); return; }
+    if (command == 2) { if (s->adb == p) { gf_adb_connect(false); s->adb = NULL; } android51_gpu_close(p->gpu); memset(p, 0, sizeof(*p)); s->result = 0; pipes_irq(s); return; }
     if (p->service == GF_CLOSED) { s->result = -4; return; }
     switch (command) {
-    case 3: s->result = (p->queued ? 1 : 0) | (pipe_writable(p) ? 2 : 0); break;
+    case 3: s->result = (p->queued ? 1 : 0) | (pipe_writable(p) ? 2 : 0);
+        if (p->service == GF_GPU) { s->result |= android51_gpu_poll(p->gpu) & 1; }
+        break;
     case 4: s->result = pipe_send(s, p); break;
     case 5: p->wanted |= 4; s->result = 0; break;
     case 6: {
@@ -271,6 +300,15 @@ static const MemoryRegionOps pipes_ops = {
 static void adb_tick(void *opaque)
 {
     GFPipes *s = opaque;
+    for (unsigned i = 0; i < GF_PIPE_LIMIT; ++i) {
+        GFPipe *gpu = &s->pipes[i];
+        if (gpu->used && gpu->service == GF_GPU) {
+            int count = android51_gpu_receive(gpu->gpu, gpu->outgoing + gpu->queued,
+                                              sizeof(gpu->outgoing) - gpu->queued);
+            if (count > 0) { gpu->queued += count; }
+            pipe_wake(s, gpu);
+        }
+    }
     GFPipe *p = s->adb;
     if (gf_adb_take_disconnect() && p) {
         gf_adb_connect(false); p->service = GF_CLOSED; p->queued = 0;
@@ -286,6 +324,7 @@ static void pipes_reset(void *opaque)
 {
     GFPipes *s = opaque;
     gf_adb_connect(false); s->adb = NULL;
+    for (unsigned i = 0; i < GF_PIPE_LIMIT; ++i) { android51_gpu_close(s->pipes[i].gpu); }
     memset(s->pipes, 0, sizeof(s->pipes));
     s->channel = s->address = s->length = s->wakes = s->result = 0;
     s->params = 0; pipes_irq(s);
@@ -293,6 +332,7 @@ static void pipes_reset(void *opaque)
 void gf_pipes_init(Android51State *board)
 {
     GFPipes *s = g_new0(GFPipes, 1);
+    active_pipes = s;
     s->board = board;
     gf_adb_init();
     s->adb_timer = timer_new_ms(QEMU_CLOCK_REALTIME, adb_tick, s);

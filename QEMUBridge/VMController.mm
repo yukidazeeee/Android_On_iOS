@@ -5,6 +5,7 @@
 #import "Audio/AudioOutput.h"
 #import "Performance/RuntimeMetrics.h"
 #include "ThirdParty/AndroidQemuCompat/qemu/android51_host.h"
+#include "ThirdParty/AndroidQemuCompat/qemu/gpu.h"
 #include "Network/GuestNetwork.hpp"
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -18,6 +19,7 @@
 - (void)hostPCM:(const uint8_t *)data length:(size_t)length;
 - (void)hostSerial:(const uint8_t *)data length:(size_t)length;
 - (void)hostState:(int)state;
+- (void)gpuFrame:(const uint8_t *)rgba width:(uint32_t)width height:(uint32_t)height;
 @end
 static void frameCallback(void *ctx, const uint8_t *p, size_t s, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     [(__bridge AEVMController *)ctx hostFrame:p stride:s x:x y:y width:w height:h];
@@ -26,6 +28,19 @@ static size_t inputCallback(void *ctx, Android51Event *e, size_t n) { return [(_
 static void pcmCallback(void *ctx, const uint8_t *p, size_t n) { [(__bridge AEVMController *)ctx hostPCM:p length:n]; }
 static void serialCallback(void *ctx, const uint8_t *p, size_t n) { [(__bridge AEVMController *)ctx hostSerial:p length:n]; }
 static void stateCallback(void *ctx, int s) { [(__bridge AEVMController *)ctx hostState:s]; }
+static void gpuPostCallback(void *ctx, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    [(__bridge AEVMController *)ctx gpuFrame:rgba width:w height:h];
+}
+static void *gpuResolve(void *ctx, unsigned api, const char *name) {
+    void **libraries = static_cast<void **>(ctx);
+    if (api > 2 || !libraries[api]) return nullptr;
+    void *result = dlsym(libraries[api], name);
+    if (!result) {
+        auto getProc = reinterpret_cast<void *(*)(const char *)>(dlsym(libraries[0], "eglGetProcAddress"));
+        if (getProc) result = getProc(name);
+    }
+    return result;
+}
 static std::string optionPath(NSString *path) {
     std::string result;
     for (char c : std::string(path.UTF8String)) { result += c; if (c == ',') result += ','; }
@@ -47,6 +62,11 @@ static std::string optionPath(NSString *path) {
     void (*_stop)(void);
     uint64_t (*_metric)(unsigned);
     bool (*_region)(void *, void *, size_t);
+    decltype(&android51_gpu_start) _gpuStart;
+    decltype(&android51_gpu_stop) _gpuStop;
+    void *_angleLibraries[3];
+    std::atomic<bool> _gpuPosted;
+    NSLock *_frameLock;
     BOOL _started, _stopped, _guestPaused;
     uint32_t _width, _height;
     UIBackgroundTaskIdentifier _saveTask;
@@ -56,6 +76,8 @@ static std::string optionPath(NSString *path) {
         _saveTask = UIBackgroundTaskInvalid;
         _metrics = [AERuntimeMetrics new]; _audio = [AEAudioOutput new];
         _logLock = [NSLock new]; _log = [NSMutableData data];
+        _frameLock = [NSLock new];
+        _gpuPosted.store(false);
         _statusText = @"起動準備"; _width = 540; _height = 960;
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(background:) name:UIApplicationDidEnterBackgroundNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(memoryWarning:) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
@@ -172,6 +194,8 @@ static std::string optionPath(NSString *path) {
     _stop = reinterpret_cast<decltype(_stop)>(resolve("android51_host_stop"));
     _metric = reinterpret_cast<decltype(_metric)>(resolve("android51_host_metric"));
     _region = reinterpret_cast<decltype(_region)>(resolve("android51_tcg_set_region"));
+    _gpuStart = reinterpret_cast<decltype(_gpuStart)>(resolve("android51_gpu_start"));
+    _gpuStop = reinterpret_cast<decltype(_gpuStop)>(resolve("android51_gpu_stop"));
     for (const char *name : {"android51_adb_connected", "android51_adb_disconnect",
                             "android51_adb_read", "android51_adb_write"}) {
         resolve(name);
@@ -180,6 +204,17 @@ static std::string optionPath(NSString *path) {
         _statusText = [NSString stringWithFormat:@"QEMU frameworkに必要な関数がありません: %@。更新したIPAを再インストールしてください。",
                       [missing componentsJoinedByString:@", "]];
         return NO;
+    }
+    NSArray<NSString *> *angleNames = @[@"libEGL", @"libGLESv1_CM", @"libGLESv2"];
+    for (NSUInteger index = 0; index < angleNames.count; ++index) {
+        NSString *name = angleNames[index];
+        NSString *binary = [[[NSBundle mainBundle] privateFrameworksPath]
+            stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.framework/%@", name, name]];
+        if (!_angleLibraries[index]) _angleLibraries[index] = dlopen(binary.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+        if (!_angleLibraries[index]) {
+            _statusText = [NSString stringWithFormat:@"描画ライブラリ %@ を読み込めません。GPU対応のIPAを再ビルドしてください。", name];
+            return NO;
+        }
     }
     NSError *error = nil;
     if (![_audio startWithSampleRate:44100 error:&error]) { _statusText = error.localizedDescription ?: @"音声の初期化に失敗しました"; return NO; }
@@ -192,7 +227,7 @@ static std::string optionPath(NSString *path) {
         "-audiodev", "none,id=audio", "-nic", emu::guestNICOption(),
         "-kernel", [path stringByAppendingPathComponent:@"kernel"].UTF8String,
         "-initrd", [path stringByAppendingPathComponent:@"ramdisk.img"].UTF8String,
-        "-append", "qemu=1 console=ttyS0 androidboot.console=ttyS0 androidboot.hardware=goldfish qemu.gles=0 android.qemud=1"};
+        "-append", "qemu=1 console=ttyS0 androidboot.console=ttyS0 androidboot.hardware=goldfish qemu.gles=1 android.qemud=1"};
     for (NSString *name in disks) {
         args.emplace_back("-drive");
         args.push_back("if=none,id=" + std::string(name.UTF8String) + ",format=raw,file=" +
@@ -211,13 +246,18 @@ static std::string optionPath(NSString *path) {
             argv.push_back(nullptr);
             Android51Host host = {ANDROID51_HOST_ABI, sizeof(Android51Host), (__bridge void *)self,
                 frameCallback, inputCallback, pcmCallback, serialCallback, stateCallback};
-            int result = self->_run((int)owned.size(), argv.data(), &host);
+            char gpuError[512] = {};
+            bool gpuReady = self->_gpuStart(self->_width, self->_height, true, gpuResolve,
+                self->_angleLibraries, gpuPostCallback, (__bridge void *)self, gpuError, sizeof(gpuError));
+            int result = gpuReady ? self->_run((int)owned.size(), argv.data(), &host) : -1;
+            if (gpuReady) self->_gpuStop();
+            NSString *gpuFailure = gpuReady ? nil : [NSString stringWithFormat:@"GPU初期化失敗: %s", gpuError];
             dispatch_async(dispatch_get_main_queue(), ^{
                 self->_worker = nil;
                 [self->_adb cancel];
                 self->_stopped = YES; self->_display.paused = YES; self->_input.userInteractionEnabled = NO; [self->_audio stop];
                 [UIApplication sharedApplication].idleTimerDisabled = NO;
-                self->_statusText = result == 0 ? @"停止しました。再起動にはアプリを開き直してください" : @"QEMUがエラーで停止しました";
+                self->_statusText = gpuFailure ?: (result == 0 ? @"停止しました。再起動にはアプリを開き直してください" : @"QEMUがエラーで停止しました");
             });
         }
     }];
@@ -255,7 +295,27 @@ static std::string optionPath(NSString *path) {
 - (void)background:(NSNotification *)note { (void)note; [self setGuestPaused:YES]; }
 - (void)memoryWarning:(NSNotification *)note { (void)note; [self setGuestPaused:YES]; _statusText = @"メモリ不足のため一時停止しました"; }
 - (void)hostFrame:(const uint8_t *)p stride:(size_t)s x:(uint32_t)x y:(uint32_t)y width:(uint32_t)w height:(uint32_t)h {
-    if ([_display submitPixels:p length:s * _height stride:s x:x y:y width:w height:h]) [_metrics receivedFrameBytes:(uint64_t)w * h * 4];
+    [_frameLock lock];
+    if (!_gpuPosted.load() && [_display submitPixels:p length:s * _height stride:s x:x y:y width:w height:h]) [_metrics receivedFrameBytes:(uint64_t)w * h * 4];
+    [_frameLock unlock];
+}
+- (void)gpuFrame:(const uint8_t *)rgba width:(uint32_t)width height:(uint32_t)height {
+    if (!rgba || width != _width || height != _height) return;
+    std::vector<uint8_t> bgra(size_t(width) * height * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t *source = rgba + size_t(height - 1 - y) * width * 4;
+        uint8_t *destination = bgra.data() + size_t(y) * width * 4;
+        for (uint32_t x = 0; x < width; ++x) {
+            destination[x*4] = source[x*4+2]; destination[x*4+1] = source[x*4+1];
+            destination[x*4+2] = source[x*4]; destination[x*4+3] = source[x*4+3];
+        }
+    }
+    [_frameLock lock];
+    if ([_display submitPixels:bgra.data() length:bgra.size() stride:size_t(width)*4 x:0 y:0 width:width height:height]) {
+        _gpuPosted.store(true);
+        [_metrics receivedFrameBytes:bgra.size()];
+    }
+    [_frameLock unlock];
 }
 - (size_t)hostInput:(Android51Event *)events capacity:(size_t)capacity {
     AEInputEvent buffer[128]; size_t count = [_input readEvents:buffer capacity:MIN(capacity, 128)];
