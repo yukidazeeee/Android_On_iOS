@@ -17,7 +17,9 @@ bootstrap_tools() {
     echo "depot_tools Python bootstrap failed: $tools_dir/python3_bin_reldir.txt missing or empty" >&2
     return 1
   fi
-  DEPOT_TOOLS_DIR="$tools_dir" "$tools_dir/python3" --version
+  # In the pinned depot_tools revision the wrapper lives in python-bin/;
+  # bootstrap installs its interpreter, not a top-level python3 executable.
+  DEPOT_TOOLS_DIR="$tools_dir" "$tools_dir/python-bin/python3" --version
 }
 
 bootstrap_tools "$outer_tools"

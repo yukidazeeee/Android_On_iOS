@@ -58,9 +58,9 @@ echo {name}-bootstrap >> "$EVENT_LOG"
 [[ "${{FAIL_BOOTSTRAP:-}}" != {name}-missing-marker ]] || exit 0
 printf 'python-bin\\n' > "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt"
 ''',
-                'python3': f'''#!/bin/bash
+                'python-bin/python3': f'''#!/bin/bash
 set -eu
-test -s "$(dirname "$0")/python3_bin_reldir.txt"
+test -s "$(dirname "$0")/../python3_bin_reldir.txt"
 echo {name}-python >> "$EVENT_LOG"
 ''',
                 'gclient': f'''#!/bin/bash
@@ -78,6 +78,7 @@ fi
             }
             for filename, content in scripts.items():
                 path = directory / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content)
                 path.chmod(0o755)
         env = dict(os.environ, EVENT_LOG=str(log), DEPOT_TOOLS_DIR='/wrong/inherited/path')
