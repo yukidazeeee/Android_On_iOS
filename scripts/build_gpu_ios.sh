@@ -20,7 +20,7 @@ cmake --build build/gpu-ios --parallel "${GPU_BUILD_JOBS:-2}"
 for reference in angle depot_tools; do
   python3 scripts/fetch_references.py --only "$reference"
 done
-export PATH="$repo_dir/ThirdParty/checkouts/depot_tools:$PATH"
+# Keep the existing Python until prepare_angle_tools.sh bootstraps depot_tools.
 export DEPOT_TOOLS_UPDATE=0
 cd ThirdParty/checkouts/angle
 python3 "$repo_dir/scripts/prepare_angle.py" "$PWD"
