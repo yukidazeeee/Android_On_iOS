@@ -129,23 +129,23 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
     }
 
     ColorBuffer *cb = new ColorBuffer(p_display, helper);
+    const bool nativeImages = ae_gpu_has_native_images(p_display);
 
     s_gles2.glGenTextures(1, &cb->m_tex);
     s_gles2.glBindTexture(GL_TEXTURE_2D, cb->m_tex);
 
     int nComp = (texInternalFormat == GL_RGB ? 3 : 4);
 
-    char* zBuff = static_cast<char*>(::calloc(nComp * p_width * p_height, 1));
-    s_gles2.glTexImage2D(GL_TEXTURE_2D,
-                         0,
-                         texInternalFormat,
-                         p_width,
-                         p_height,
-                         0,
-                         texInternalFormat,
-                         GL_UNSIGNED_BYTE,
-                         zBuff);
-    ::free(zBuff);
+    // RGB rows are tightly packed, including widths not divisible by four.
+    // Native images supply storage below; do not allocate/upload a temporary
+    // GL texture that is immediately replaced by imported Metal storage.
+    s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (!nativeImages) {
+        std::vector<unsigned char> zero(size_t(nComp) * p_width * p_height, 0);
+        s_gles2.glTexImage2D(GL_TEXTURE_2D, 0, texInternalFormat,
+                           p_width, p_height, 0, texInternalFormat,
+                           GL_UNSIGNED_BYTE, zero.data());
+    }
 
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -157,15 +157,11 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
     //
     s_gles2.glGenTextures(1, &cb->m_blitTex);
     s_gles2.glBindTexture(GL_TEXTURE_2D, cb->m_blitTex);
-    s_gles2.glTexImage2D(GL_TEXTURE_2D,
-                         0,
-                         texInternalFormat,
-                         p_width,
-                         p_height,
-                         0,
-                         texInternalFormat,
-                         GL_UNSIGNED_BYTE,
-                         NULL);
+    if (!nativeImages) {
+        s_gles2.glTexImage2D(GL_TEXTURE_2D, 0, texInternalFormat,
+                           p_width, p_height, 0, texInternalFormat,
+                           GL_UNSIGNED_BYTE, NULL);
+    }
 
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     s_gles2.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -176,7 +172,7 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
     cb->m_height = p_height;
     cb->m_internalFormat = texInternalFormat;
 
-    if (ae_gpu_has_native_images(p_display)) {
+    if (nativeImages) {
         cb->m_eglImage = ae_gpu_create_native_image(p_display, p_width, p_height, texInternalFormat);
         cb->m_blitEGLImage = ae_gpu_create_native_image(p_display, p_width, p_height, texInternalFormat);
         if (!cb->m_eglImage || !cb->m_blitEGLImage) {

@@ -21,7 +21,10 @@ EGLImageKHR ae_gpu_create_native_image(EGLDisplay display, int width, int height
             texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
             width:width height:height mipmapped:NO];
         descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-        descriptor.storageMode = MTLStorageModePrivate;
+        // These imported images receive CPU uploads as well as GPU rendering.
+        // Opt out of Metal's opaque/compressed layout for this interop path.
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.allowGPUOptimizedContents = NO;
         id<MTLTexture> texture = [metalDevice newTextureWithDescriptor:descriptor];
         if (!texture) return EGL_NO_IMAGE_KHR;
         const EGLint attributes[] = {0x345D /* EGL_TEXTURE_INTERNAL_FORMAT_ANGLE */,

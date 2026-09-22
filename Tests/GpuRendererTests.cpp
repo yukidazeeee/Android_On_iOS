@@ -177,6 +177,33 @@ static void colorbuffer(Android51GpuStream *stream) {
     }
     send_packet(stream, 10014, {color});
 }
+static void odd_width_rgb(Android51GpuStream *stream) {
+    for (uint32_t width : {1u, 3u, 5u}) {
+        constexpr uint32_t height = 3;
+        send_packet(stream, 10012, {width,height,0x1907});
+        uint32_t color = reply_word(stream);
+        assert(color);
+        send_packet(stream, 10023, {color,0,0,width,height,0x1908,0x1401,width*height*4});
+        for (uint32_t pixel = 0; pixel < width * height; ++pixel)
+            assert(reply_word(stream) == 0xff000000);
+        // Tight RGB rows: 3, 9 and 15 bytes, all different from alignment 4.
+        uint32_t byteCount = width * height * 3;
+        uint32_t padded = (byteCount + 3) & ~3u;
+        std::vector<uint32_t> update{color,0,0,width,height,0x1907,0x1401,padded};
+        update.resize(8 + padded / 4, 0);
+        auto *pixels = reinterpret_cast<unsigned char *>(update.data() + 8);
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x) pixels[(y * width + x) * 3 + y] = 255;
+        send_packet(stream, 10024, update);
+        assert(reply_word(stream) == 0);
+        send_packet(stream, 10023, {color,0,0,width,height,0x1908,0x1401,width*height*4});
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+                assert(reply_word(stream) == (0xff000000u | (0xffu << (y * 8))));
+        send_packet(stream, 10014, {color});
+    }
+}
+
 int main() {
     Libraries libs{dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL),
         dlopen("libGLESv1_CM.so.1", RTLD_NOW | RTLD_LOCAL),
@@ -205,6 +232,7 @@ int main() {
         draw_context(stream, version, 0x1908); // RGBA
         draw_context(stream, version, 0x1907); // RGB / RGB565 image semantics
     }
+    odd_width_rgb(stream);
     colorbuffer(stream);
     assert(!ae_gpu_renderer_shutdown());
     android51_gpu_close(stream);

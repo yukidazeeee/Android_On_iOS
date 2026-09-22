@@ -49,6 +49,9 @@
     _pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:error];
     MTLTextureDescriptor *texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
     texture.storageMode = MTLStorageModeShared;
+    // replaceRegion uploads arbitrary dirty rectangles from CPU memory.
+    // Keep the upload texture out of AGX's compressed partial-block path.
+    texture.allowGPUOptimizedContents = NO;
     texture.usage = MTLTextureUsageShaderRead;
     _texture = [device newTextureWithDescriptor:texture];
     if (!_commands || !_pipeline || !_texture) return nil;

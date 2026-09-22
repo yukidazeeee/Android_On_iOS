@@ -76,3 +76,16 @@ LD_LIBRARY_PATH=/path/to/mesa/lib ctest --test-dir build/gpu --output-on-failure
 - 対応ソース archive にはダウンロード済み LLVM / Python / Siso などのホストバイナリを入れず、
   固定 revision、DEPS、取得スクリプトと実際の engine source を残す。
 - CI ログに artifact ごとの容量を記録する。変更後の時間・容量の実測値はまだない。
+
+## AGX partial macroblock crash の調査
+
+`com.apple.metal.agx.CompressedTexturePartialMacroblockAccess` での
+EXC_BAD_ACCESS が報告されたが、完全なスタックがなく原因は未確定。
+CPU 更新する表示 texture と EGLImage 用 texture は、Metal の shared storage と
+`allowGPUOptimizedContents = NO` を使う互換設定へ変更した。
+これは Apple の [texture 最適化からの opt-out 手順](https://developer.apple.com/documentation/metal/optimizing-texture-data)
+に基づく対策で、AGX のクラッシュ解消を実機確認したという意味ではない。
+
+併せて native image 取り込み前の不要な GL texture allocation/upload を除去し、
+旧 EGL 経路の初期化でも tightly packed RGB rows に UNPACK_ALIGNMENT=1 を設定する。
+幅 1 / 3 / 5、高さ 3 の RGB color buffer を初期化・更新・読み戻す回帰試験を追加。
