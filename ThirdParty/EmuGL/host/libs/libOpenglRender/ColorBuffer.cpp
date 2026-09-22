@@ -1,3 +1,5 @@
+#include "GPU/SharedImage.h"
+#include <vector>
 /*
 * Copyright (C) 2011 The Android Open Source Project
 *
@@ -174,7 +176,26 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
     cb->m_height = p_height;
     cb->m_internalFormat = texInternalFormat;
 
-    if (has_eglimage_texture_2d) {
+    if (ae_gpu_has_native_images(p_display)) {
+        cb->m_eglImage = ae_gpu_create_native_image(p_display, p_width, p_height, texInternalFormat);
+        cb->m_blitEGLImage = ae_gpu_create_native_image(p_display, p_width, p_height, texInternalFormat);
+        if (!cb->m_eglImage || !cb->m_blitEGLImage) {
+            delete cb;
+            return NULL;
+        }
+        s_gles2.glBindTexture(GL_TEXTURE_2D, cb->m_tex);
+        s_gles2.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, cb->m_eglImage);
+        std::vector<unsigned char> zero(size_t(p_width) * p_height * nComp, 0);
+        s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        s_gles2.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, p_width, p_height,
+                              texInternalFormat, GL_UNSIGNED_BYTE, zero.data());
+        s_gles2.glBindTexture(GL_TEXTURE_2D, cb->m_blitTex);
+        s_gles2.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, cb->m_blitEGLImage);
+        if (s_gles2.glGetError() != GL_NO_ERROR) {
+            delete cb;
+            return NULL;
+        }
+    } else if (has_eglimage_texture_2d) {
         cb->m_eglImage = s_egl.eglCreateImageKHR(
                 p_display,
                 s_egl.eglGetCurrentContext(),
@@ -188,6 +209,10 @@ ColorBuffer* ColorBuffer::create(EGLDisplay p_display,
                 EGL_GL_TEXTURE_2D_KHR,
                 (EGLClientBuffer)SafePointerFromUInt(cb->m_blitTex),
                 NULL);
+    }
+    if (!cb->m_eglImage || !cb->m_blitEGLImage) {
+        delete cb;
+        return NULL;
     }
     return cb;
 }
@@ -305,13 +330,13 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
     s_gles2.glViewport(0, 0, m_width, m_height);
 
     // render m_blitTex
-    m_helper->getTextureDraw()->draw(m_blitTex, 0.);
+    bool drawn = m_helper->getTextureDraw()->draw(m_blitTex, 0.);
 
     // Restore previous viewport.
     s_gles2.glViewport(vport[0], vport[1], vport[2], vport[3]);
     unbindFbo();
 
-    return true;
+    return drawn;
 }
 
 bool ColorBuffer::bindToTexture() {

@@ -252,6 +252,10 @@ static std::string optionPath(NSString *path) {
             for (size_t index = 0; index + 1 < owned.size(); ++index) {
                 if (owned[index] == "-append") { owned[index+1] = emu::guestKernelArguments(gpuReady); break; }
             }
+            if (gpuReady) {
+                const char *message = "[GPU] ANGLE Metal initialized; shared color-buffer probe passed; qemu.gles=1; opengles pipe ready.\n";
+                [self hostSerial:reinterpret_cast<const uint8_t *>(message) length:strlen(message)];
+            }
             if (!gpuReady) {
                 NSString *diagnostic = [NSString stringWithFormat:@"[GPU] %s\n[GPU] Software framebuffer fallback; GLES2/WebView acceleration unavailable.\n", gpuError];
                 NSData *bytes = [diagnostic dataUsingEncoding:NSUTF8StringEncoding];

@@ -2,6 +2,24 @@
 
 現状: EmuGL GLES1/2 decoder、Goldfish GPU pipe、ANGLE/Metal の iOS ビルド・同梱経路を追加済み。Linux の実 EGL/GLES による描画試験は通過。ただし iOS および Android 4/5/6 実イメージ上での Browser / WebView の正常動作は未確認であり、完全対応とはしていない。
 
+## Metal backend の EGLImage 接続修正
+
+固定した ANGLE の `DisplayMtl::generateExtensions` は
+`EGL_ANGLE_metal_texture_client_buffer` を提供する一方、
+`EGL_KHR_gl_texture_2D_image` を提供していない。
+`ImageMtl::initialize` も `EGL_METAL_TEXTURE_ANGLE` のみを受け付ける。
+従来の必須拡張チェックと GL texture からの image 作成は、この backend と互換でなかった。
+
+`GPU/MetalImages.mm` は EGLDisplay が使う MTLDevice を問い合わせ、その device で
+RGBA texture を作成して EGLImage に取り込む。ColorBuffer の描画用・転送用 texture を
+その image に結びつけ、独立したゲスト context 間で既存の image 共有経路を使う。
+ゲストに `qemu.gles=1` を通知する前に、小さな color buffer の作成・image 取り込みを確認する。
+成功時は `[GPU] ANGLE Metal initialized; shared color-buffer probe passed` を記録する。
+また、pbuffer だけを使う実行では未作成だった TextureDraw を GPU 初期化時に作成する。
+従来は window color buffer の flush で null pointer を参照していた。
+GLES1/2 の RGB/RGBA 両方で window → shared image → readback を試験する。
+この変更の iOS 実機・Browser 動作はまだ未検証。
+
 ## 今回の実装と起動時の扱い
 
 - `GPU/` は分割パケット、同期応答、GLES1/2 と renderControl を処理し、実 EGL context / pbuffer / color buffer に接続する。
@@ -47,3 +65,14 @@ LD_LIBRARY_PATH=/path/to/mesa/lib ctest --test-dir build/gpu --output-on-failure
 5. API23の実イメージ上でEGL初期化、GLES2のshader compile/link、描画・readback、texture/FBO/EGLImage、複数context・複数アプリ、Browserと独立WebViewアプリを検証する。
 
 本環境にはiOS SDKおよび検証用Androidシステムイメージがなく、このrendererの実装・統合・実機検証は完了していない。UI変更・ダウンロード対策の完了と、GPU修正の完了は別である。
+
+## Actions の所要時間・配布容量
+
+- iOS ビルドと Linux の native / Goldfish 試験は並行実行する。
+- Xcode・runner architecture・固定依存・ビルドスクリプトをキーに、iOS sysroot と
+  ANGLE の checkout / incremental build をキャッシュする。初回は従来どおり取得・ビルドが必要。
+- アプリ artifact は IPA、entitlements、署名手順のみ。
+  対応ソースは `AndroidEmu-corresponding-source` から別途取得できる。
+- 対応ソース archive にはダウンロード済み LLVM / Python / Siso などのホストバイナリを入れず、
+  固定 revision、DEPS、取得スクリプトと実際の engine source を残す。
+- CI ログに artifact ごとの容量を記録する。変更後の時間・容量の実測値はまだない。

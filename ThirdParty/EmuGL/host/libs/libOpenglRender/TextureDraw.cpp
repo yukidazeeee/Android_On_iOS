@@ -102,7 +102,9 @@ TextureDraw::TextureDraw(EGLDisplay display) :
         mPositionSlot(-1),
         mInCoordSlot(-1),
         mTextureSlot(-1),
-        mRotationSlot(-1) {
+        mRotationSlot(-1),
+        mVertexBuffer(0),
+        mIndexBuffer(0) {
     // Create shaders and program.
     mVertexShader = createShader(GL_VERTEX_SHADER, kVertexShaderSource);
     mFragmentShader = createShader(GL_FRAGMENT_SHADER, kFragmentShaderSource);

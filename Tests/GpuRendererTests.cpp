@@ -11,6 +11,8 @@
 #include <mutex>
 
 struct Libraries { void *egl, *gles1, *gles2; };
+static void *reject_image(void *, void *, unsigned, void *, const int *) { return nullptr; }
+
 static void *resolve(void *opaque, unsigned api, const char *name) {
     auto *libs = static_cast<Libraries *>(opaque);
     void *library = api == 0 ? libs->egl : api == 1 ? libs->gles1 : libs->gles2;
@@ -20,6 +22,11 @@ static void *resolve(void *opaque, unsigned api, const char *name) {
         if (proc) result = proc(name);
     }
     return result;
+}
+static void *resolve_without_images(void *opaque, unsigned api, const char *name) {
+    if (api == 0 && std::strcmp(name, "eglCreateImageKHR") == 0)
+        return reinterpret_cast<void *>(reject_image);
+    return resolve(opaque, api, name);
 }
 static void exact_read(Android51GpuStream *stream, void *data, size_t size) {
     auto *cursor = static_cast<unsigned char *>(data);
@@ -48,10 +55,11 @@ static uint32_t reply_word(Android51GpuStream *stream) {
     exact_read(stream, &word, sizeof(word));
     return word;
 }
-static uint32_t choose_config(Android51GpuStream *stream, unsigned version) {
+static uint32_t choose_config(Android51GpuStream *stream, unsigned version, uint32_t colorFormat) {
     // EGL RGB8, pbuffer, ES1/ES2. Literal wire layout from renderControl.in.
-    send_packet(stream, 10006, {44, 0x3024,8, 0x3023,8, 0x3022,8,
-        0x3033,1, 0x3040,version == 1 ? 1u : 4u, 0x3038, 44, 4, 1});
+    send_packet(stream, 10006, {52, 0x3024,8, 0x3023,8, 0x3022,8,
+        0x3021,colorFormat == 0x1908 ? 8u : 0u,
+        0x3033,1, 0x3040,version == 1 ? 1u : 4u, 0x3038, 52, 4, 1});
     uint32_t config = reply_word(stream);
     assert(reply_word(stream) == 1);
     return config;
@@ -107,8 +115,8 @@ static void shader_and_fbo(Android51GpuStream *stream) {
     assert(reply_word(stream) == 0);
     send_packet(stream, 2052, {0x8d40,0});
 }
-static void draw_context(Android51GpuStream *stream, unsigned version) {
-    uint32_t config = choose_config(stream, version);
+static void draw_context(Android51GpuStream *stream, unsigned version, uint32_t colorFormat) {
+    uint32_t config = choose_config(stream, version, colorFormat);
     send_packet(stream, 10008, {config, 0, version});
     uint32_t context = reply_word(stream);
     assert(context);
@@ -117,6 +125,10 @@ static void draw_context(Android51GpuStream *stream, unsigned version) {
     assert(surface);
     send_packet(stream, 10017, {context,surface,surface});
     assert(reply_word(stream) == 1);
+    send_packet(stream, 10012, {16,16,colorFormat});
+    uint32_t color = reply_word(stream);
+    assert(color);
+    send_packet(stream, 10015, {surface,color});
     // IEEE754 1.0f, 0.0f, 0.0f, 1.0f; clear and read actual pixels.
     send_packet(stream, version == 1 ? 1025 : 2064, {0x3f800000,0,0,0x3f800000});
     send_packet(stream, version == 1 ? 1069 : 2063, {0x4000});
@@ -124,11 +136,17 @@ static void draw_context(Android51GpuStream *stream, unsigned version) {
     std::array<unsigned char,4> pixel{};
     exact_read(stream, pixel.data(), pixel.size());
     assert((pixel == std::array<unsigned char,4>{255,0,0,255}));
+    // Exercise the guest window -> shared EGLImage -> renderer context path.
+    send_packet(stream, 10016, {surface});
+    assert(reply_word(stream) == 0);
+    send_packet(stream, 10023, {color,0,0,1,1,0x1908,0x1401,4});
+    assert(reply_word(stream) == 0xff0000ff);
     if (version == 2) shader_and_fbo(stream);
     send_packet(stream, 10017, {0,0,0});
     assert(reply_word(stream) == 1);
     send_packet(stream, 10011, {surface});
     send_packet(stream, 10009, {context});
+    send_packet(stream, 10014, {color});
 }
 
 static std::mutex frame_mutex;
@@ -165,6 +183,12 @@ int main() {
         dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_LOCAL)};
     assert(libs.egl && libs.gles1 && libs.gles2);
     char error[512]{};
+    // A loaded EGL library with unusable shared images must not enable GPU.
+    assert(!ae_gpu_renderer_initialize(16, 16, false, resolve_without_images,
+        &libs, posted, nullptr, error, sizeof(error)));
+    assert(std::strstr(error, "shared color-buffer") != nullptr);
+    assert(!android51_gpu_ready());
+    assert(ae_gpu_renderer_shutdown());
     if (!ae_gpu_renderer_initialize(16, 16, false, resolve, &libs, posted, nullptr, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         return 1;
@@ -177,8 +201,10 @@ int main() {
     std::array<unsigned char,4> reply{};
     exact_read(stream, reply.data(), reply.size());
     assert((reply == std::array<unsigned char,4>{1,0,0,0}));
-    draw_context(stream, 1);
-    draw_context(stream, 2);
+    for (unsigned version : {1u, 2u}) {
+        draw_context(stream, version, 0x1908); // RGBA
+        draw_context(stream, version, 0x1907); // RGB / RGB565 image semantics
+    }
     colorbuffer(stream);
     assert(!ae_gpu_renderer_shutdown());
     android51_gpu_close(stream);

@@ -118,6 +118,16 @@ extern "C" bool ae_gpu_renderer_initialize(uint32_t width, uint32_t height, bool
     try {
         if (!ae_gpu_dispatch(resolve, resolve_context, metal)) return fail("Required EGL/GLES entry points missing");
         if (!FrameBuffer::initialize(width, height)) return fail("EGL/GLES1/GLES2 framebuffer initialization failed");
+        // Exercise image allocation/import before announcing qemu.gles=1.
+        // In particular Metal cannot export EGL_GL_TEXTURE_2D_KHR images.
+        for (GLenum format : {GL_RGBA, GL_RGB}) {
+            auto probe = FrameBuffer::getFB()->createColorBuffer(1, 1, format);
+            if (!probe) {
+                FrameBuffer::finalize();
+                return fail("EGL shared color-buffer image allocation/import failed");
+            }
+            FrameBuffer::getFB()->closeColorBuffer(probe);
+        }
         post_callback = post;
         post_context = context;
         FrameBuffer::getFB()->setPostCallback(posted, nullptr);

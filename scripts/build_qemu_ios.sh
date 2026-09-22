@@ -21,7 +21,15 @@ python3 scripts/prepare_ios_sysroot.py
 export ANDROID51_UTM_ROOT="$repo_dir/ThirdParty/checkouts/UTM"
 # UTM's generated build stays inside our ignored workspace build directory.
 cd build/ios-dependencies
-bash build-minimal.sh -p ios -a arm64 -q "$repo_dir/ThirdParty/checkouts/qemu"
+if [[ "${ANDROIDEMU_SYSROOT_CACHED:-0}" == 1 &&
+      -f build-iOS-arm64/BUILD_SUCCESS &&
+      -x sysroot-iOS-arm64/host/bin/pkg-config &&
+      -f sysroot-iOS-arm64/lib/pkgconfig/glib-2.0.pc &&
+      -f sysroot-iOS-arm64/lib/pkgconfig/slirp.pc ]]; then
+  echo 'Reusing iOS sysroot from an exact toolchain/input cache match.'
+else
+  bash build-minimal.sh -p ios -a arm64 -q "$repo_dir/ThirdParty/checkouts/qemu"
+fi
 cd "$repo_dir"
 ios_prefix="$repo_dir/build/ios-dependencies/sysroot-iOS-arm64"
 gpu_cflags=""
@@ -30,7 +38,7 @@ gpu_libraries=()
 if [[ "${ANDROIDEMU_GPU:-1}" == 1 ]]; then
   bash scripts/build_gpu_ios.sh "$ios_prefix"
   gpu_cflags="-DANDROID51_GPU_RENDERER=1"
-  gpu_ldflags="$repo_dir/build/gpu-ios/libandroidemu_gpu.a -lc++"
+  gpu_ldflags="$repo_dir/build/gpu-ios/libandroidemu_gpu.a -lc++ -framework Metal -framework Foundation"
   gpu_libraries=("$ios_prefix/lib/libEGL.dylib" "$ios_prefix/lib/libGLESv1_CM.dylib" "$ios_prefix/lib/libGLESv2.dylib")
 fi
 ios_sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"

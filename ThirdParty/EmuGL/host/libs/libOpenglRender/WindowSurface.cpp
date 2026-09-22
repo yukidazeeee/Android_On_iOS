@@ -118,12 +118,12 @@ bool WindowSurface::flushColorBuffer() {
         return false;
     }
 
-    mAttachedColorBuffer->blitFromCurrentReadBuffer();
+    bool copied = mAttachedColorBuffer->blitFromCurrentReadBuffer();
 
     // restore current context/surface
-    s_egl.eglMakeCurrent(mDisplay, prevDrawSurf, prevReadSurf, prevContext);
+    bool restored = s_egl.eglMakeCurrent(mDisplay, prevDrawSurf, prevReadSurf, prevContext);
 
-    return true;
+    return copied && restored;
 }
 
 bool WindowSurface::resize(unsigned int p_width, unsigned int p_height)

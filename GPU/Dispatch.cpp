@@ -1,4 +1,5 @@
 #include "Renderer.h"
+#include "SharedImage.h"
 #include "EGLDispatch.h"
 #include "GLESv1Dispatch.h"
 #include "GLESv2Dispatch.h"
@@ -8,6 +9,7 @@
 EGLDispatch s_egl{};
 gles1_decoder_context_t s_gles1;
 gles2_decoder_context_t s_gles2;
+static bool metal_backend;
 static AEGpuResolve resolver;
 static void *resolver_context;
 static EGLDisplay (*platform_display)(EGLenum, void *, const EGLint *);
@@ -25,6 +27,7 @@ void *gles2_dispatch_get_proc_func(const char *name, void *) {
     return resolver(resolver_context, 2, name);
 }
 bool ae_gpu_dispatch(AEGpuResolve resolve, void *context, bool metal) {
+    metal_backend = metal;
     resolver = resolve;
     resolver_context = context;
 #include "egl_dispatch.inc"
@@ -50,3 +53,13 @@ bool ae_gpu_dispatch(AEGpuResolve resolve, void *context, bool metal) {
 // Desktop native window creation is deliberately unavailable.
 extern "C" EGLNativeWindowType createSubWindow(FBNativeWindowType, int, int, int, int) { return {}; }
 extern "C" void destroySubWindow(EGLNativeWindowType) {}
+
+bool ae_gpu_has_native_images(EGLDisplay display) {
+    const char *extensions = s_egl.eglQueryString(display, EGL_EXTENSIONS);
+    return metal_backend && extensions &&
+        std::strstr(extensions, "EGL_ANGLE_metal_texture_client_buffer") &&
+        s_egl.eglGetProcAddress;
+}
+#ifndef __APPLE__
+EGLImageKHR ae_gpu_create_native_image(EGLDisplay, int, int, unsigned) { return EGL_NO_IMAGE_KHR; }
+#endif

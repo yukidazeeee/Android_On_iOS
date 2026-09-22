@@ -42,6 +42,7 @@ public:
     // clockwise rotation angle in degrees (clockwise in the GL Y-upwards
     // coordinate space).
     bool draw(GLuint texture, float rotationDegrees);
+    bool isValid() const { return mProgram != 0; }
 
 private:
     EGLDisplay mDisplay;

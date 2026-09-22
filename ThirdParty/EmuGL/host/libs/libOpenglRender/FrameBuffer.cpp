@@ -1,3 +1,4 @@
+#include "GPU/SharedImage.h"
 /*
 * Copyright (C) 2011 The Android Open Source Project
 *
@@ -319,7 +320,7 @@ bool FrameBuffer::initialize(int width, int height)
     //     EGL_KHR_gl_texture_2d_image
     //     GL_OES_EGL_IMAGE (by both GLES implementations [1 and 2])
     //
-    if (!fb->m_caps.has_eglimage_texture_2d) {
+    if (!fb->m_caps.has_eglimage_texture_2d && !ae_gpu_has_native_images(fb->m_eglDisplay)) {
         ERR("Failed: Missing egl_image related extension(s)\n");
         bind.release();
         delete fb;
@@ -379,6 +380,15 @@ bool FrameBuffer::initialize(int width, int height)
     fb->m_glVendor = (const char*)s_gles2.glGetString(GL_VENDOR);
     fb->m_glRenderer = (const char*)s_gles2.glGetString(GL_RENDERER);
     fb->m_glVersion = (const char*)s_gles2.glGetString(GL_VERSION);
+
+    // Color-buffer flushes need the blit shader even without a desktop window.
+    fb->m_textureDraw = new TextureDraw(fb->m_eglDisplay);
+    if (!fb->m_textureDraw->isValid()) {
+        ERR("Failed to initialize color-buffer blit shader\n");
+        bind.release();
+        delete fb;
+        return false;
+    }
 
     // release the FB context
     bind.release();
@@ -492,7 +502,7 @@ bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
                         // the last posted color buffer.
 
                         // NOTE: We need a context to create a TextureDraw.
-                        fb->m_textureDraw = new TextureDraw(fb->getDisplay());
+                        // TextureDraw was initialized with the shared pbuffer context.
                         s_gles2.glViewport(0, 0, p_width, p_height);
                         fb->m_zRot = zRot;
                         fb->post(fb->m_lastPostedColorBuffer, false);

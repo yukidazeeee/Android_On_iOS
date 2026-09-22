@@ -48,7 +48,6 @@ jobs:
           if-no-files-found: ignore
   ios:
     runs-on: macos-15
-    needs: [native, goldfish]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Select an installed stable Xcode with iOS 26 SDK
@@ -64,6 +63,11 @@ jobs:
             -std=c++11 -Wall -Wextra -Werror -fsyntax-only \
             -IThirdParty/EmuGL/shared \
             ThirdParty/EmuGL/shared/emugl/common/lazy_instance.cpp
+          xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=17.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -std=c++17 -fobjc-arc -Wall -Wextra -Werror -fsyntax-only \
+            -IThirdParty/EmuGL/host/libs/libOpenglRender \
+            -IThirdParty/EmuGL/host/libs/Translator/include GPU/MetalImages.mm
       - name: Swift model tests
         run: bash scripts/test_models.sh
       - name: Install cross-build tools
@@ -73,7 +77,28 @@ jobs:
           python3 -m venv build/tools-venv
           build/tools-venv/bin/pip install setuptools six pyparsing pyyaml distlib mako
           echo "$PWD/build/tools-venv/bin" >> "$GITHUB_PATH"
+      - name: Identify Apple toolchain for dependency caches
+        id: apple-toolchain
+        shell: bash
+        run: echo "version=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Cache iOS dependency sysroot and source inputs
+        id: sysroot-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            build/ios-dependencies
+            ThirdParty/checkouts/UTM
+          key: ios-sysroot-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.apple-toolchain.outputs.version }}-${{ hashFiles('ThirdParty/dependencies.lock.json', 'scripts/prepare_ios_sysroot.py', 'scripts/build_qemu_ios.sh') }}
+      - name: Cache ANGLE checkout and incremental build
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ThirdParty/checkouts/angle
+            ThirdParty/checkouts/depot_tools
+          key: angle-metal-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.apple-toolchain.outputs.version }}-${{ hashFiles('ThirdParty/dependencies.lock.json', 'scripts/build_gpu_ios.sh', 'scripts/prepare_angle.py', 'scripts/prepare_angle_tools.sh') }}
       - name: Compile arm64 iOS core and Goldfish engine
+        env:
+          ANDROIDEMU_SYSROOT_CACHED: ${{ steps.sysroot-cache.outputs.cache-hit == 'true' && '1' || '0' }}
         shell: bash
         run: |
           set -o pipefail
@@ -89,10 +114,21 @@ jobs:
         run: |
           git archive --format=tar.gz --output=build/artifacts/AndroidEmu-source.tar.gz HEAD
           python3 scripts/collect_engine_source.py
+          du -h build/artifacts/*
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: AndroidEmu-development-unsigned
-          path: build/artifacts/
+          path: |
+            build/artifacts/*.ipa
+            build/artifacts/*.entitlements
+            build/artifacts/signing-notes.txt
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: AndroidEmu-corresponding-source
+          path: build/artifacts/*source.tar.gz
+          compression-level: 0
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()

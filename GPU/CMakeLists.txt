@@ -55,6 +55,14 @@ add_library(androidemu_gpu STATIC Renderer.cpp Dispatch.cpp ${GEN}/egl_dispatch.
   ${RENDER}/TextureDraw.cpp ${RENDER}/WindowSurface.cpp
   ${COMMON}/lazy_instance.cpp ${COMMON}/thread_store.cpp ${COMMON}/smart_ptr.cpp
   ${COMMON}/shared_library.cpp)
+if(APPLE)
+  enable_language(OBJCXX)
+  set_property(TARGET androidemu_gpu PROPERTY OBJCXX_STANDARD 17)
+  set_property(TARGET androidemu_gpu PROPERTY OBJCXX_STANDARD_REQUIRED ON)
+  target_sources(androidemu_gpu PRIVATE MetalImages.mm)
+  set_source_files_properties(MetalImages.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  target_link_libraries(androidemu_gpu PUBLIC "-framework Metal" "-framework Foundation")
+endif()
 target_include_directories(androidemu_gpu PRIVATE ${GEN} ${DECODER_INCLUDES} ${RENDER}
   ${EMUGL}/host/include ${EMUGL}/host/include/libOpenglRender ${EMUGL}/shared ${EMUGL}/shared/OpenglCodecCommon
   ${EMUGL}/host/libs/Translator/include)

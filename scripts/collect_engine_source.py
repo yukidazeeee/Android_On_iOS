@@ -13,6 +13,16 @@ def allowed(info):
     parts = Path(info.name).parts
     if any(p in ('.git', '__pycache__', 'utm_build', 'out') for p in parts):
         return None
+    # Downloaded host toolchains and CIPD runtimes are not corresponding
+    # engine source. Keep DEPS/manifests/scripts so they remain reproducible.
+    if any(p.startswith(('bootstrap-', '.cipd')) for p in parts):
+        return None
+    excluded = ('third_party/llvm-build/', 'third_party/rust-toolchain/',
+                'third_party/siso/cipd/', 'third_party/reclient/',
+                'third_party/node/mac/', 'third_party/node/mac_arm64/',
+                'buildtools/mac/', 'buildtools/linux64/')
+    if any(piece in info.name + '/' for piece in excluded):
+        return None
     if Path(info.name).suffix in ('.o', '.a', '.dylib', '.so', '.pyc', '.img', '.apk'):
         return None
     return info
