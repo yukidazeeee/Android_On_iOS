@@ -56,6 +56,14 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/select_xcode.py >> "$GITHUB_ENV"
+      - name: Check GPU initialization source for arm64 iOS
+        shell: bash
+        run: |
+          xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=17.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -std=c++11 -Wall -Wextra -Werror -fsyntax-only \
+            -IThirdParty/EmuGL/shared \
+            ThirdParty/EmuGL/shared/emugl/common/lazy_instance.cpp
       - name: Swift model tests
         run: bash scripts/test_models.sh
       - name: Install cross-build tools

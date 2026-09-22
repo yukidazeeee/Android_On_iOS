@@ -97,9 +97,9 @@ struct LazyInstanceState {
     void doneConstructing();
 
 #ifdef _WIN32
-    typedef LONG volatile AtomicType;
+    typedef LONG AtomicType;
 #else
-    typedef int volatile AtomicType;
+    typedef int AtomicType;
 #endif
 
     volatile AtomicType mState;
