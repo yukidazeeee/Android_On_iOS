@@ -89,3 +89,18 @@ CPU 更新する表示 texture と EGLImage 用 texture は、Metal の shared s
 併せて native image 取り込み前の不要な GL texture allocation/upload を除去し、
 旧 EGL 経路の初期化でも tightly packed RGB rows に UNPACK_ALIGNMENT=1 を設定する。
 幅 1 / 3 / 5、高さ 3 の RGB color buffer を初期化・更新・読み戻す回帰試験を追加。
+
+## 画面方向と共有画像の引き渡し
+
+EmuGL の TextureDraw は window surface を color buffer に転送するときに上下を反転し、
+Android の top-down buffer 配置へ変換する。iOS の gpuFrame では行を再反転せず、
+RGBA→BGRA のチャンネル変換だけを行う。CPU gralloc 更新も同じ行配置を使う。
+四隅を別の色にした GLES1/2・RGB/RGBA の画像を別 pipe で post し、
+表示用画素まで検証するテストを追加した。
+
+共有画像は producer のコピー完了、および renderer の転送／CPU 更新完了を
+`glFinish` で待ってから他の context に引き渡す。現時点では確実な同期を優先しており、
+フレームレートへの影響は iOS 実機で測定が必要。
+読み戻し失敗時は前回の画素を post しない。WindowSurface の flush 失敗も成功扱いにしない。
+これらは表示側の修正であり、Android の system_server / SurfaceFlinger が再起動して
+ロゴに戻る現象を解消したという確認はまだない。

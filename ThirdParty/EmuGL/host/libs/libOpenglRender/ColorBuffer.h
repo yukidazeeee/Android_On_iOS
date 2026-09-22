@@ -133,7 +133,7 @@ public:
 
     // Read the content of the whole ColorBuffer as 32-bit RGBA pixels.
     // |img| must be a buffer large enough (i.e. width * height * 4).
-    void readback(unsigned char* img);
+    bool readback(unsigned char* img);
 
 private:
     ColorBuffer();  // no default constructor.

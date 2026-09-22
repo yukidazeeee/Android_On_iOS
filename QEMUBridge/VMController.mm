@@ -7,6 +7,7 @@
 #include "ThirdParty/AndroidQemuCompat/qemu/android51_host.h"
 #include "ThirdParty/AndroidQemuCompat/qemu/gpu.h"
 #include "GPUStartup.hpp"
+#include "Display/GPUFrame.hpp"
 #include "Network/GuestNetwork.hpp"
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -318,14 +319,7 @@ static std::string optionPath(NSString *path) {
 - (void)gpuFrame:(const uint8_t *)rgba width:(uint32_t)width height:(uint32_t)height {
     if (!rgba || width != _width || height != _height) return;
     std::vector<uint8_t> bgra(size_t(width) * height * 4);
-    for (uint32_t y = 0; y < height; ++y) {
-        const uint8_t *source = rgba + size_t(height - 1 - y) * width * 4;
-        uint8_t *destination = bgra.data() + size_t(y) * width * 4;
-        for (uint32_t x = 0; x < width; ++x) {
-            destination[x*4] = source[x*4+2]; destination[x*4+1] = source[x*4+1];
-            destination[x*4+2] = source[x*4]; destination[x*4+3] = source[x*4+3];
-        }
-    }
+    emu::gpuFrameToBGRA(rgba, bgra.data(), size_t(width) * height);
     [_frameLock lock];
     if ([_display submitPixels:bgra.data() length:bgra.size() stride:size_t(width)*4 x:0 y:0 width:width height:height]) {
         _gpuPosted.store(true);

@@ -1,4 +1,5 @@
 #include "GPU/Renderer.h"
+#include "Display/GPUFrame.hpp"
 #include "ThirdParty/AndroidQemuCompat/qemu/gpu.h"
 #include <cassert>
 #include <cstdio>
@@ -9,10 +10,18 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 struct Libraries { void *egl, *gles1, *gles2; };
 static void *reject_image(void *, void *, unsigned, void *, const int *) { return nullptr; }
 
+static std::atomic<bool> reject_readback{false};
+using ReadPixels = void (*)(int, int, int, int, unsigned, unsigned, void *);
+static ReadPixels real_read_pixels;
+static void checked_read_pixels(int x, int y, int width, int height,
+                                unsigned format, unsigned type, void *pixels) {
+    real_read_pixels(x, y, reject_readback.load() ? -1 : width, height, format, type, pixels);
+}
 static void *resolve(void *opaque, unsigned api, const char *name) {
     auto *libs = static_cast<Libraries *>(opaque);
     void *library = api == 0 ? libs->egl : api == 1 ? libs->gles1 : libs->gles2;
@@ -20,6 +29,10 @@ static void *resolve(void *opaque, unsigned api, const char *name) {
     if (!result) {
         auto proc = reinterpret_cast<void *(*)(const char *)>(dlsym(libs->egl, "eglGetProcAddress"));
         if (proc) result = proc(name);
+    }
+    if (api == 2 && std::strcmp(name, "glReadPixels") == 0 && result) {
+        real_read_pixels = reinterpret_cast<ReadPixels>(result);
+        return reinterpret_cast<void *>(checked_read_pixels);
     }
     return result;
 }
@@ -115,6 +128,7 @@ static void shader_and_fbo(Android51GpuStream *stream) {
     assert(reply_word(stream) == 0);
     send_packet(stream, 2052, {0x8d40,0});
 }
+static void assert_posted_corners(uint32_t color);
 static void draw_context(Android51GpuStream *stream, unsigned version, uint32_t colorFormat) {
     uint32_t config = choose_config(stream, version, colorFormat);
     send_packet(stream, 10008, {config, 0, version});
@@ -141,6 +155,20 @@ static void draw_context(Android51GpuStream *stream, unsigned version, uint32_t 
     assert(reply_word(stream) == 0);
     send_packet(stream, 10023, {color,0,0,1,1,0x1908,0x1401,4});
     assert(reply_word(stream) == 0xff0000ff);
+    // An asymmetric image distinguishes vertical flips from channel swaps.
+    send_packet(stream, version == 1 ? 1092 : 2090, {0x0c11});
+    auto quadrant = [&](uint32_t x, uint32_t y, uint32_t r, uint32_t g, uint32_t b) {
+        send_packet(stream, version == 1 ? 1148 : 2144, {x,y,8,8});
+        send_packet(stream, version == 1 ? 1025 : 2064, {r,g,b,0x3f800000});
+        send_packet(stream, version == 1 ? 1069 : 2063, {0x4000});
+    };
+    quadrant(0,8,0,0x3f800000,0); // top left green
+    quadrant(8,8,0,0,0x3f800000); // top right blue
+    quadrant(8,0,0x3f800000,0x3f800000,0x3f800000); // bottom right white
+    send_packet(stream, version == 1 ? 1088 : 2086, {0x0c11});
+    send_packet(stream, 10016, {surface});
+    assert(reply_word(stream) == 0);
+    assert_posted_corners(color);
     if (version == 2) shader_and_fbo(stream);
     send_packet(stream, 10017, {0,0,0});
     assert(reply_word(stream) == 1);
@@ -151,11 +179,50 @@ static void draw_context(Android51GpuStream *stream, unsigned version, uint32_t 
 
 static std::mutex frame_mutex;
 static std::vector<unsigned char> last_frame;
+static unsigned posted_count;
 static void posted(void *, const uint8_t *pixels, uint32_t width, uint32_t height) {
     assert(width == 16 && height == 16);
     std::lock_guard<std::mutex> lock(frame_mutex);
     last_frame.assign(pixels, pixels + width * height * 4);
+    ++posted_count;
 }
+static void assert_posted_corners(uint32_t color) {
+    // SurfaceFlinger's post arrives on a different guest pipe/host thread.
+    auto *consumer = android51_gpu_open();
+    assert(consumer);
+    uint32_t flags = 0;
+    assert(android51_gpu_send(consumer, &flags, sizeof(flags)) == sizeof(flags));
+    send_packet(consumer, 10018, {color});
+    send_packet(consumer, 10000, {});
+    assert(reply_word(consumer) == 1);
+    {
+        std::lock_guard<std::mutex> lock(frame_mutex);
+        assert(last_frame.size() == 16 * 16 * 4);
+        std::vector<uint8_t> display(last_frame.size());
+        emu::gpuFrameToBGRA(last_frame.data(), display.data(), 16 * 16);
+        auto corner = [&](size_t x, size_t y, std::array<uint8_t,4> expected) {
+            assert(std::memcmp(display.data() + (y * 16 + x) * 4, expected.data(), 4) == 0);
+        };
+        corner(0,0,{0,255,0,255});
+        corner(15,0,{255,0,0,255});
+        corner(0,15,{0,0,255,255});
+        corner(15,15,{255,255,255,255});
+    }
+    unsigned count;
+    { std::lock_guard<std::mutex> lock(frame_mutex); count = posted_count; }
+    reject_readback.store(true);
+    send_packet(consumer, 10018, {color});
+    send_packet(consumer, 10000, {});
+    assert(reply_word(consumer) == 1);
+    { std::lock_guard<std::mutex> lock(frame_mutex); assert(posted_count == count); }
+    reject_readback.store(false);
+    send_packet(consumer, 10018, {color});
+    send_packet(consumer, 10000, {});
+    assert(reply_word(consumer) == 1);
+    { std::lock_guard<std::mutex> lock(frame_mutex); assert(posted_count == count + 1); }
+    android51_gpu_close(consumer);
+}
+
 static void colorbuffer(Android51GpuStream *stream) {
     send_packet(stream, 10012, {16,16,0x1908});
     uint32_t color = reply_word(stream);

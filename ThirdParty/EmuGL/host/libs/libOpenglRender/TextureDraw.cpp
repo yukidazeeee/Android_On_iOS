@@ -246,7 +246,7 @@ bool TextureDraw::draw(GLuint texture, float rotation) {
 
     // TODO(digit): Restore previous program state.
 
-    return true;
+    return err == GL_NO_ERROR;
 }
 
 TextureDraw::~TextureDraw() {

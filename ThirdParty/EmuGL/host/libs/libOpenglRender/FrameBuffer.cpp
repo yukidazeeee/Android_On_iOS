@@ -723,9 +723,7 @@ bool FrameBuffer::flushWindowSurfaceColorBuffer(HandleType p_surface)
     }
 
     WindowSurface* surface = (*w).second.Ptr();
-    surface->flushColorBuffer();
-
-    return true;
+    return surface->flushColorBuffer();
 }
 
 bool FrameBuffer::setWindowSurfaceColorBuffer(HandleType p_surface,
@@ -973,7 +971,10 @@ bool FrameBuffer::post(HandleType p_colorbuffer, bool needLock)
     if (!m_subWin) {
         if (m_onPost && (*c).second.cb->width() == m_width &&
             (*c).second.cb->height() == m_height) {
-            (*c).second.cb->readback(m_fbImage);
+            if (!(*c).second.cb->readback(m_fbImage)) {
+                ERR("GPU post: color-buffer readback failed for %#x\n", p_colorbuffer);
+                goto EXIT;
+            }
             m_onPost(m_onPostContext, m_width, m_height, -1,
                      GL_RGBA, GL_UNSIGNED_BYTE, m_fbImage);
             ret = true;
@@ -1019,8 +1020,7 @@ bool FrameBuffer::post(HandleType p_colorbuffer, bool needLock)
     //
     // Send framebuffer (without FPS overlay) to callback
     //
-    if (m_onPost) {
-        (*c).second.cb->readback(m_fbImage);
+    if (m_onPost && (*c).second.cb->readback(m_fbImage)) {
         m_onPost(m_onPostContext,
                  m_width,
                  m_height,

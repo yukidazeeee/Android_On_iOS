@@ -275,6 +275,7 @@ void ColorBuffer::subUpdate(int x,
     s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     s_gles2.glTexSubImage2D(
             GL_TEXTURE_2D, 0, x, y, width, height, p_format, p_type, pixels);
+    s_gles2.glFinish();
 }
 
 bool ColorBuffer::blitFromCurrentReadBuffer()
@@ -299,6 +300,8 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
                                   m_width, m_height);
         s_gles2.glDeleteTextures(1, &tmpTex);
         s_gles2.glBindTexture(GL_TEXTURE_2D, currTexBind);
+        // Publish to the renderer context before it samples this shared image.
+        s_gles2.glFinish();
     }
     else {
         s_gles1.glGetIntegerv(GL_TEXTURE_BINDING_2D, &currTexBind);
@@ -309,6 +312,7 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
                                  m_width, m_height);
         s_gles1.glDeleteTextures(1, &tmpTex);
         s_gles1.glBindTexture(GL_TEXTURE_2D, currTexBind);
+        s_gles1.glFinish();
     }
 
     ScopedHelperContext context(m_helper);
@@ -331,6 +335,8 @@ bool ColorBuffer::blitFromCurrentReadBuffer()
     // Restore previous viewport.
     s_gles2.glViewport(vport[0], vport[1], vport[2], vport[3]);
     unbindFbo();
+    // rcFlushWindowColorBuffer must publish complete pixels to other pipes.
+    s_gles2.glFinish();
 
     return drawn;
 }
@@ -374,14 +380,11 @@ bool ColorBuffer::post(float rotation) {
     return m_helper->getTextureDraw()->draw(m_tex, rotation);
 }
 
-void ColorBuffer::readback(unsigned char* img) {
+bool ColorBuffer::readback(unsigned char* img) {
     ScopedHelperContext context(m_helper);
-    if (!context.isOk()) {
-        return;
-    }
-    if (bindFbo(&m_fbo, m_tex)) {
-        s_gles2.glReadPixels(
-                0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, img);
-        unbindFbo();
-    }
+    if (!context.isOk() || !img || !bindFbo(&m_fbo, m_tex)) return false;
+    s_gles2.glReadPixels(0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, img);
+    bool success = s_gles2.glGetError() == GL_NO_ERROR;
+    unbindFbo();
+    return success;
 }
