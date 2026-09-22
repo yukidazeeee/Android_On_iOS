@@ -24,7 +24,10 @@ export PATH="$repo_dir/ThirdParty/checkouts/depot_tools:$PATH"
 export DEPOT_TOOLS_UPDATE=0
 cd ThirdParty/checkouts/angle
 python3 "$repo_dir/scripts/prepare_angle.py" "$PWD"
-gclient sync --no-history --shallow
+bash "$repo_dir/scripts/prepare_angle_tools.sh" "$PWD" "$repo_dir/ThirdParty/checkouts/depot_tools"
+# Build wrappers must use the same initialized tools as ANGLE's build hooks.
+export PATH="$PWD/third_party/depot_tools:$PATH"
+export DEPOT_TOOLS_DIR="$PWD/third_party/depot_tools"
 # Fail if dependency synchronization moved the locked ANGLE revision.
 python3 "$repo_dir/scripts/prepare_angle.py" "$PWD"
 gn gen out/ios --args='target_os="ios" target_cpu="arm64" target_environment="device" ios_deployment_target="17.0" ios_enable_code_signing=false is_component_build=false is_debug=false symbol_level=0 angle_enable_metal=true angle_enable_gl=false angle_enable_vulkan=false angle_enable_null=false angle_build_tests=false use_remoteexec=false'
